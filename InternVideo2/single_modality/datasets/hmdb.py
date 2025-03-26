@@ -62,7 +62,7 @@ class HMDBRawFrameClsDataset(Dataset):
                 "Unable to import `decord` which is required to read videos.")
 
         import pandas as pd
-        cleaned = pd.read_csv(self.anno_path, header=None, delimiter=self.split)
+        cleaned = pd.read_csv(self.anno_path, header=None, delimiter=",")
         self.dataset_samples = list(cleaned.values[:, 0].astype('str'))
         self.total_frames = list(cleaned.values[:, 1] - 1) # max - 1
         self.label_array = list(cleaned.values[:, -1])
@@ -371,7 +371,7 @@ class HMDBVideoClsDataset(Dataset):
             raise ImportError("Unable to import `decord` which is required to read videos.")
 
         import pandas as pd
-        cleaned = pd.read_csv(self.anno_path, header=None, delimiter=self.split)
+        cleaned = pd.read_csv(self.anno_path, header=None, delimiter=",")
         self.dataset_samples = list(cleaned.values[:, 0])
         self.label_array = list(cleaned.values[:, 1])
 

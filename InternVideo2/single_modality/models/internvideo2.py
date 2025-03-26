@@ -10,9 +10,9 @@ from functools import partial
 from einops import rearrange
 
 from .pos_embed import get_3d_sincos_pos_embed, get_2d_sincos_pos_embed, get_1d_sincos_pos_embed
-from .flash_attention_class import FlashAttention
-from flash_attn.modules.mlp import FusedMLP
-from flash_attn.ops.rms_norm import DropoutAddRMSNorm
+# from .flash_attention_class import FlashAttention
+# from flash_attn.modules.mlp import FusedMLP
+# from flash_attn.ops.rms_norm import DropoutAddRMSNorm
 
 
 class CrossAttention(nn.Module):
@@ -59,7 +59,7 @@ class CrossAttention(nn.Module):
             v_bias = self.v_bias
         
         q = F.linear(input=x, weight=self.q.weight, bias=q_bias)
-        q = q.reshape(B, N, 1, self.num_heads, -1).permute(2, 0, 3, 1, 4).squeeze(0)  # (B, N_head, N_q, dim)
+        q = q.reshape(B, N, 1, self.num_heads, -1).permute(2, 0, 3, 1, 4).squeeze(0)  # (B, num_heads, N, D)
         
         k = F.linear(input=k, weight=self.k.weight, bias=k_bias)
         k = k.reshape(B, N_k, 1, self.num_heads, -1).permute(2, 0, 3, 1, 4).squeeze(0)
@@ -68,16 +68,26 @@ class CrossAttention(nn.Module):
         v = v.reshape(B, N_v, 1, self.num_heads, -1).permute(2, 0, 3, 1, 4).squeeze(0)
         
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))  # (B, N_head, N_q, N_k)
+        # Compute attention in chunks to save memory:
+        # Instead of computing the full [B, num_heads, N, N_k] tensor at once,
+        # we loop over chunks of the query tokens.
+        chunk_size = 128  # you can experiment with this value
+        outputs = []
+        for i in range(0, q.shape[-2], chunk_size):
+            # q_chunk shape: [B, num_heads, chunk, D]
+            q_chunk = q[:, :, i:i+chunk_size, :]
+            # Compute attention scores for the chunk: [B, num_heads, chunk, N_k]
+            attn_chunk = q_chunk @ k.transpose(-2, -1)
+            attn_chunk = attn_chunk.softmax(dim=-1)
+            attn_chunk = self.attn_drop(attn_chunk)
+            out_chunk = attn_chunk @ v  # [B, num_heads, chunk, D]
+            outputs.append(out_chunk)
+        x_out = torch.cat(outputs, dim=2)  # [B, num_heads, N, D]
         
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        
-        return x
+        x_out = x_out.transpose(1, 2).reshape(B, N, C)
+        x_out = self.proj(x_out)
+        x_out = self.proj_drop(x_out)
+        return x_out
 
 
 class AttentiveBlock(nn.Module):
@@ -102,7 +112,6 @@ class AttentiveBlock(nn.Module):
         x_k = self.norm1_k(x_kv + pos_k)
         x_v = self.norm1_v(x_kv)
         x = self.cross_attn(x_q, k=x_k, v=x_v)
-        
         return x
 
 
@@ -152,6 +161,8 @@ class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., use_flash_attn=False,
                  causal=False, norm_layer=nn.LayerNorm, qk_normalization=False, use_fused_rmsnorm=False):
         super().__init__()
+        use_flash_attn = False
+        use_fused_rmsnorm = False
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -163,9 +174,9 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         
         self.use_flash_attn = use_flash_attn
-        if use_flash_attn:
-            self.causal = causal
-            self.inner_attn = FlashAttention(attention_dropout=attn_drop)
+        # if use_flash_attn:
+        #     self.causal = causal
+        #     self.inner_attn = FlashAttention(attention_dropout=attn_drop)
         
         self.qk_normalization = qk_normalization
         self.q_norm = norm_layer(dim) if qk_normalization else nn.Identity()
@@ -175,25 +186,34 @@ class Attention(nn.Module):
     def _naive_attn(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)  # shapes: [B, num_heads, N, D]
         
         if self.qk_normalization:
             B_, H_, N_, D_ = q.shape
             q = self.q_norm(q.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
             k = self.k_norm(k.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
         
-        attn = ((q * self.scale) @ k.transpose(-2, -1))
-        # attn = attn - attn.max(-1)[0].unsqueeze(-1)  # in case of overflow for fp16
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # Scale q
+        q = q * self.scale
         
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        # Chunked attention computation:
+        chunk_size = 128  # adjust this value as needed
+        outputs = []
+        for i in range(0, q.shape[-2], chunk_size):
+            q_chunk = q[:, :, i:i+chunk_size, :]  # [B, num_heads, chunk, D]
+            attn_chunk = q_chunk @ k.transpose(-2, -1)  # [B, num_heads, chunk, N]
+            attn_chunk = attn_chunk.softmax(dim=-1)
+            attn_chunk = self.attn_drop(attn_chunk)
+            out_chunk = attn_chunk @ v  # [B, num_heads, chunk, D]
+            outputs.append(out_chunk)
+        x_out = torch.cat(outputs, dim=2)  # [B, num_heads, N, D]
+        
+        x_out = x_out.transpose(1, 2).reshape(B, N, C)
+        x_out = self.proj(x_out)
+        x_out = self.proj_drop(x_out)
+        return x_out
     
     def _flash_attn(self, x, key_padding_mask=None, need_weights=False):
-        
         qkv = self.qkv(x)
         qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, h=self.num_heads)
         
@@ -220,8 +240,7 @@ class Attention(nn.Module):
 
 
 class Mlp(nn.Module):
-    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
-    """
+    """ MLP as used in Vision Transformer, MLP-Mixer and related networks """
     
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU,
                  bias=True, drop=0.):
@@ -254,6 +273,10 @@ class Block(nn.Module):
             fused_mlp_heuristic=1, with_cp=False, qk_normalization=False, layerscale_no_force_fp32=False,
             use_fused_rmsnorm=False):
         super().__init__()
+
+        use_flash_attn = False
+        use_fused_mlp = False
+        use_fused_rmsnorm = False
         
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
@@ -262,13 +285,13 @@ class Block(nn.Module):
                               use_fused_rmsnorm=use_fused_rmsnorm)
         self.ls1 = LayerScale(dim, init_values=init_values,
                               force_fp32=(not layerscale_no_force_fp32)) if init_values else nn.Identity()
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         if use_fused_mlp:
-            self.mlp = FusedMLP(in_features=dim, hidden_features=mlp_hidden_dim, heuristic=fused_mlp_heuristic)
+            self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+            # self.mlp = FusedMLP(in_features=dim, hidden_features=mlp_hidden_dim, heuristic=fused_mlp_heuristic)
         else:
             self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.ls2 = LayerScale(dim, init_values=init_values,
@@ -300,8 +323,7 @@ class Block(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    """ 3D Image to Patch Embedding
-    """
+    """ 3D Image to Patch Embedding """
     
     def __init__(
             self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, 
@@ -317,7 +339,7 @@ class PatchEmbed(nn.Module):
             num_frames // tubelet_size, 
             img_size[0] // patch_size[0], 
             img_size[1] // patch_size[1]
-        ) # (T, H, W)
+        )  # (T, H, W)
         self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
         
         self.proj = nn.Conv3d(
@@ -366,7 +388,9 @@ class InternVideo2(nn.Module):
             init_scale: float = 0.001,
         ):
         super().__init__()
-        
+        use_flash_attn = False
+        use_fused_rmsnorm = False
+        use_fused_mlp = False
         assert use_flash_attn == use_fused_rmsnorm == use_fused_mlp, print(
             'use_flash_attn, use_fused_rmsnorm and use_fused_mlp should be consistent')
         print(mlp_ratio)
@@ -375,7 +399,7 @@ class InternVideo2(nn.Module):
         self.embed_dim = embed_dim
         
         if use_fused_rmsnorm:
-            norm_layer_for_blocks = partial(DropoutAddRMSNorm, eps=1e-6, prenorm=True)
+            norm_layer_for_blocks = partial(RMSNorm, eps=1e-6)
         else:
             norm_layer_for_blocks = partial(RMSNorm, eps=1e-6)
         self.norm_layer_for_blocks = norm_layer_for_blocks
@@ -386,7 +410,6 @@ class InternVideo2(nn.Module):
         num_patches = self.patch_embed.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         
-        # stolen from https://github.com/facebookresearch/mae_st/blob/dc072aaaf640d06892e23a33b42223a994efe272/models_vit.py#L65-L73C17
         self.sep_pos_embed = sep_pos_embed
         if sep_pos_embed:
             print("Use seperable position embedding")
@@ -400,7 +423,6 @@ class InternVideo2(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        # choose which layer to use checkpoint
         with_cp_list = [False] * depth
         if use_checkpoint:
             for idx in range(depth):
@@ -440,25 +462,21 @@ class InternVideo2(nn.Module):
     def init_pos_embed(self):
         print("Init pos_embed from sincos pos_embed")
         if self.sep_pos_embed:
-            # trunc_normal_(self.pos_embed_spatial, std=.02)
-            # trunc_normal_(self.pos_embed_temporal, std=.02)
-            # trunc_normal_(self.pos_embed_cls, std=.02)
             pos_embed_spatial = get_2d_sincos_pos_embed(
                 self.pos_embed_spatial.shape[-1], 
-                self.patch_embed.grid_size[1], # height & weight
+                self.patch_embed.grid_size[1],
             )
             self.pos_embed_spatial.data.copy_(torch.from_numpy(pos_embed_spatial).float().unsqueeze(0))
             pos_embed_temporal = get_1d_sincos_pos_embed(
                 self.pos_embed_spatial.shape[-1], 
-                self.patch_embed.grid_size[0], # t_size
+                self.patch_embed.grid_size[0],
             )
             self.pos_embed_temporal.data.copy_(torch.from_numpy(pos_embed_temporal).float().unsqueeze(0))
         else:
-            # trunc_normal_(self.pos_embed, std=.02)
             pos_embed = get_3d_sincos_pos_embed(
                 self.pos_embed.shape[-1], 
-                self.patch_embed.grid_size[1], # height & weight
-                self.patch_embed.grid_size[0], # t_size
+                self.patch_embed.grid_size[1],
+                self.patch_embed.grid_size[0],
                 cls_token=True
             )
             self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
@@ -466,7 +484,7 @@ class InternVideo2(nn.Module):
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
@@ -475,7 +493,6 @@ class InternVideo2(nn.Module):
     def fix_init_weight(self):
         def rescale(param, layer_id):
             param.div_(math.sqrt(2.0 * layer_id))
-
         for layer_id, layer in enumerate(self.blocks):
             rescale(layer.attn.proj.weight.data, layer_id + 1)
             rescale(layer.mlp.fc2.weight.data, layer_id + 1)
@@ -501,12 +518,8 @@ class InternVideo2(nn.Module):
         x = self.patch_embed(x.type(self.dtype))
         B, T, L, C = x.shape  # T: temporal; L: spatial
         x = x.view([B, T * L, C])
-
-        # append cls token
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-
-        # add pos_embed
         if self.sep_pos_embed:
             pos_embed = self.pos_embed_spatial.repeat(
                 1, self.grid_size[0], 1
@@ -535,23 +548,10 @@ class InternVideo2(nn.Module):
             x, residual = x
             if residual is not None:
                 x = x + residual
-        
         x = self.clip_projector(x)
-
         x = self.fc_norm(x)
         x = self.head(self.fc_dropout(x))
         return x
-
-
-@register_model
-def internvideo2_small_patch14_224(pretrained=False, **kwargs):
-    model = InternVideo2(
-        img_size=224, patch_size=14, embed_dim=384, 
-        depth=12, num_heads=6, mlp_ratio=4, 
-        attn_pool_num_heads=16, clip_embed_dim=768,
-        **kwargs
-    )
-    return model
 
 
 @register_model
@@ -575,9 +575,30 @@ def internvideo2_large_patch14_224(pretrained=False, **kwargs):
     )
     return model
 
+@register_model
+def internvideo2_small_patch14_224(pretrained=False, **kwargs):
+    model = InternVideo2(
+        img_size=224, patch_size=14, embed_dim=384, 
+        depth=12, num_heads=6, mlp_ratio=4, 
+        attn_pool_num_heads=16, clip_embed_dim=768,
+        **kwargs
+    )
+    return model
+
+# @register_model
+# def internvideo2_1B_patch14_224(pretrained=False, **kwargs):
+#     model = InternVideo2(
+#         img_size=224, patch_size=14, embed_dim=1408, 
+#         depth=40, num_heads=16, mlp_ratio=48/11, 
+#         attn_pool_num_heads=16, clip_embed_dim=768,
+#         **kwargs
+#     )
+#     return model
 
 @register_model
 def internvideo2_1B_patch14_224(pretrained=False, **kwargs):
+    # Remove pretrained_cfg if it exists so it won't be passed to InternVideo2's __init__
+    kwargs.pop("pretrained_cfg", None)
     model = InternVideo2(
         img_size=224, patch_size=14, embed_dim=1408, 
         depth=40, num_heads=16, mlp_ratio=48/11, 
@@ -612,6 +633,7 @@ if __name__ == '__main__':
     num_frames = 8
     img_size = 224
 
+    # Example: Uncomment the model you wish to profile.
     # model = internvideo2_1B_patch14_224(num_classes=400).cuda().half()
     model = internvideo2_6B_patch14_224(num_classes=400).cuda().half()
     print(model)
