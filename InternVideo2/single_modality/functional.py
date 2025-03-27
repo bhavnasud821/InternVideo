@@ -22,6 +22,25 @@ def crop_clip(clip, min_h, min_w, h, w):
                         'but got list of {0}'.format(type(clip[0])))
     return cropped
 
+def resize_clip_uniform(clip, size, interpolation='bilinear'):
+    if isinstance(clip[0], np.ndarray):
+        if interpolation == 'bilinear':
+            np_inter = cv2.INTER_LINEAR
+        else:
+            np_inter = cv2.INTER_NEAREST
+        scaled = [
+            cv2.resize(img, (size, size), interpolation=np_inter) for img in clip
+        ]
+    elif isinstance(clip[0], PIL.Image.Image):
+        if interpolation == 'bilinear':
+            pil_inter = PIL.Image.BILINEAR
+        else:
+            pil_inter = PIL.Image.NEAREST
+        scaled = [img.resize((size, size), pil_inter) for img in clip]
+    else:
+        raise TypeError('Expected numpy.ndarray or PIL.Image' +
+                        'but got list of {0}'.format(type(clip[0])))
+    return scaled
 
 def resize_clip(clip, size, interpolation='bilinear'):
     if isinstance(clip[0], np.ndarray):

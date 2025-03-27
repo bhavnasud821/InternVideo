@@ -994,6 +994,25 @@ class Resize(object):
         return resized
 
 
+class UniformResize(object):
+    """Resizes a list of (H x W x C) numpy.ndarray to the final size in both dimensions
+    The larger the original image is, the more times it takes to
+    interpolate
+    Args:
+    interpolation (str): Can be one of 'nearest', 'bilinear'
+    defaults to nearest
+    size (tuple): (width, height)
+    """
+
+    def __init__(self, size, interpolation='nearest'):
+        self.size = size
+        self.interpolation = interpolation
+
+    def __call__(self, clip):
+        resized = FF.resize_clip_uniform(
+            clip, self.size, interpolation=self.interpolation)
+        return resized
+
 class RandomCrop(object):
     """Extract random crop at the same location for a list of images
     Args:

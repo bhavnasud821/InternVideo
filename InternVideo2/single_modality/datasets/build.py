@@ -387,7 +387,7 @@ def build_dataset(is_train, test_mode, args):
             new_width=320,
             filename_tmpl=args.filename_tmpl,
             args=args)
-        nb_classes = 51
+        nb_classes = 51 if not args.nb_classes else args.nb_classes
     elif args.data_set in ['ANet', 'HACS', 'ANet_interval', 'HACS_interval']:
         mode = 'train' if is_train else ('test' if test_mode else 'validation')
         anno_path = os.path.join(args.data_path, f"{mode}.csv")

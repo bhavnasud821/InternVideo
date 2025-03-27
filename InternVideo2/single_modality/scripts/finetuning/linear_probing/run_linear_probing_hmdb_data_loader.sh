@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='linear_probing_B_model_hmdb_data_loader'
+JOB_NAME='linear_probing_B_model_hmdb_data_loader_no_mixup_no_test_spatial_cropping'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
@@ -35,12 +35,12 @@ python run_linear_probing.py \
     --input_size 224 \
     --short_side_size 224 \
     --save_ckpt_freq 100 \
-    --num_frames 16 \
+    --num_frames 8 \
     --orig_t_size 8 \
     --num_workers 2 \
     --warmup_epochs 0 \
     --tubelet_size 1 \
-    --epochs 20 \
+    --epochs 2 \
     --lr 2e-3 \
     --min_lr 0 \
     --drop_path 0.0 \
@@ -52,8 +52,8 @@ python run_linear_probing.py \
     --opt adamw \
     --opt_betas 0.9 0.999 \
     --weight_decay 0 \
-    --test_num_segment 2 \
-    --test_num_crop 3 \
+    --test_num_segment 1 \
+    --test_num_crop 1 \
     --dist_eval \
     --bf16 \
     --zero_stage 1

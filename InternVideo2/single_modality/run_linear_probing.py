@@ -110,8 +110,8 @@ def get_args():
     parser.add_argument('--resplit', action='store_true', default=False, help='Do not random erase first (clean) augmentation split')
 
     # Mixup params
-    parser.add_argument('--mixup', type=float, default=0.8, help='mixup alpha, mixup enabled if > 0.')
-    parser.add_argument('--cutmix', type=float, default=1.0, help='cutmix alpha, cutmix enabled if > 0.')
+    parser.add_argument('--mixup', type=float, default=0, help='mixup alpha, mixup enabled if > 0.')
+    parser.add_argument('--cutmix', type=float, default=0, help='cutmix alpha, cutmix enabled if > 0.')
     parser.add_argument('--cutmix_minmax', type=float, nargs='+', default=None, help='cutmix min/max ratio')
     parser.add_argument('--mixup_prob', type=float, default=1.0, help='Probability of performing mixup or cutmix')
     parser.add_argument('--mixup_switch_prob', type=float, default=0.5, help='Probability of switching to cutmix')

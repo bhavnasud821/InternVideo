@@ -9,7 +9,7 @@ from decord import VideoReader, cpu
 from torch.utils.data import Dataset
 from .random_erasing import RandomErasing
 from .video_transforms import (
-    Compose, Resize, CenterCrop, Normalize,
+    Compose, UniformResize, Resize, CenterCrop, Normalize,
     create_random_augment, random_short_side_scale_jitter, 
     random_crop, random_resized_crop_with_shift, random_resized_crop,
     horizontal_flip, random_short_side_scale_jitter, uniform_crop, 
@@ -378,18 +378,23 @@ class HMDBVideoClsDataset(Dataset):
         if (mode == 'train'):
             pass
 
-        elif (mode == 'validation'):
-            self.data_transform = Compose([
-                Resize(self.short_side_size, interpolation='bilinear'),
-                CenterCrop(size=(self.crop_size, self.crop_size)),
-                ClipToTensor(),
-                Normalize(mean=[0.485, 0.456, 0.406],
-                                        std=[0.229, 0.224, 0.225])
-            ])
+        # elif (mode == 'validation'):
+        #     self.data_transform = Compose([
+        #         Resize(self.short_side_size, interpolation='bilinear'),
+        #         CenterCrop(size=(self.crop_size, self.crop_size)),
+        #         ClipToTensor(),
+        #         Normalize(mean=[0.485, 0.456, 0.406],
+        #                                 std=[0.229, 0.224, 0.225])
+        #     ])
         elif mode == 'test':
-            self.data_resize = Compose([
-                Resize(size=(short_side_size), interpolation='bilinear')
-            ])
+            if self.test_num_crop == 1:
+                self.data_resize = Compose([
+                    UniformResize(size=(short_side_size), interpolation='bilinear')
+                ])
+            else:
+                self.data_resize = Compose([
+                    Resize(size=(short_side_size), interpolation='bilinear')
+                ])
             self.data_transform = Compose([
                 ClipToTensor(),
                 Normalize(mean=[0.485, 0.456, 0.406],
@@ -464,21 +469,27 @@ class HMDBVideoClsDataset(Dataset):
             buffer = self.data_resize(buffer)
             if isinstance(buffer, list):
                 buffer = np.stack(buffer, 0)
-
-            spatial_step = 1.0 * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size) \
-                                / (self.test_num_crop - 1)
             temporal_start = chunk_nb # 0/1
-            spatial_start = int(split_nb * spatial_step)
-            if buffer.shape[1] >= buffer.shape[2]:
+
+            if self.test_num_crop == 1:
                 buffer = buffer[temporal_start::2, \
-                       spatial_start:spatial_start + self.short_side_size, :, :]
+                    :, :, :]
             else:
-                buffer = buffer[temporal_start::2, \
-                       :, spatial_start:spatial_start + self.short_side_size, :]
+                spatial_step = 1.0 * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size) \
+                                    / (self.test_num_crop - 1)
+                spatial_start = int(split_nb * spatial_step)
+                if buffer.shape[1] >= buffer.shape[2]:
+                    buffer = buffer[temporal_start::2, \
+                        spatial_start:spatial_start + self.short_side_size, :, :]
+                else:
+                    buffer = buffer[temporal_start::2, \
+                        :, spatial_start:spatial_start + self.short_side_size, :]
 
             buffer = self.data_transform(buffer)
-            return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
-                   chunk_nb, split_nb
+            return buffer, self.test_label_array[index], sample, \
+                chunk_nb, split_nb
+            # return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
+            #        chunk_nb, split_nb
         else:
             raise NameError('mode {} unkown'.format(self.mode))
 

@@ -1281,7 +1281,7 @@ def safe_barrier():
 ############################################################################
 def train_class_batch(model, samples, target, criterion):
     outputs = model(samples)
-    print(f"[DEBUG] Model outputs: {outputs}")
+    # print(f"[DEBUG] Model outputs: {outputs}")
     loss = criterion(outputs, target)
     return loss, outputs
 
@@ -1563,11 +1563,11 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
     model.eval()
 
     final_result = []
-    all_top1 = []
+    # all_top1 = []
     all_targets = []
     all_video_ids = []
-    all_top5 = []
-    all_top5_scores = []
+    # all_top5 = []
+    # all_top5_scores = []
     all_probs = []
 
     # Category mapping for 6 classes
@@ -1581,8 +1581,11 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
     }
 
     for batch in metric_logger.log_every(data_loader, 10, header):
+        print("batch ", batch[1:])
         videos, target = batch[0], batch[1]
         video_ids = batch[2] if len(batch) >= 3 else ["unknown"] * videos.shape[0]
+        chunk_nb = batch[3]
+        split_nb = batch[4]
 
         videos = videos.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
@@ -1595,66 +1598,94 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
             loss = criterion(output[valid_mask], target[valid_mask])
         else:
             loss = torch.tensor(0.0, device=output.device)
+        print("target shape ", target.shape)
+        print("output shape ", output.shape)
         probs = torch.softmax(output, dim=-1)
-        top1_preds = output.argmax(dim=-1)
-        top5_scores, top5_preds = torch.topk(probs, 5, dim=-1)
+        print("probs shape ", probs.shape)
+        # top1_preds = output.argmax(dim=-1)
+        # top5_scores, top5_preds = torch.topk(probs, 5, dim=-1)
 
-        all_top1.extend(top1_preds.cpu().tolist())
+        # all_top1.extend(top1_preds.cpu().tolist())
         all_targets.extend(target.cpu().tolist())
         all_video_ids.extend(video_ids)
-        all_top5_scores.extend(top5_scores.cpu().tolist())
-        all_top5.extend(top5_preds.cpu().tolist())
+        # all_top5_scores.extend(top5_scores.cpu().tolist())
+        # all_top5.extend(top5_preds.cpu().tolist())
         all_probs.append(probs.cpu())
 
-        # Save per-sample predictions (JSON-serialized) for merging
-        for i in range(output.size(0)):
-            prob_json = json.dumps(output.data[i].float().cpu().numpy().tolist())
-            line = f"{video_ids[i]} {prob_json} {int(target[i].cpu().numpy())} NA NA\n"
-            final_result.append(line)
+        # # Save per-sample predictions (JSON-serialized) for merging
+        # for i in range(output.size(0)):
+        #     prob_json = json.dumps(output.data[i].float().cpu().numpy().tolist())
+        #     line = f"{video_ids[i]} {prob_json} {int(target[i].cpu().numpy())} {str(int(chunk_nb[i].cpu().numpy()))} {str(int(split_nb[i].cpu().numpy()))}\n"
+        #     final_result.append(line)
 
-        if valid_mask.sum() > 0:
-            valid_outputs = output[valid_mask]
-            valid_targets = target[valid_mask]
-            acc1, acc5 = accuracy(valid_outputs, valid_targets, topk=(1, 5))
-            batch_valid_count = valid_mask.sum().item()
-            metric_logger.meters['acc1'].update(acc1.item(), n=batch_valid_count)
-            metric_logger.meters['acc5'].update(acc5.item(), n=batch_valid_count)
-        metric_logger.update(loss=loss.item())
+        # if valid_mask.sum() > 0:
+        #     valid_outputs = output[valid_mask]
+        #     valid_targets = target[valid_mask]
+        #     acc1, acc5 = accuracy(valid_outputs, valid_targets, topk=(1, 5))
+        #     batch_valid_count = valid_mask.sum().item()
+        #     metric_logger.meters['acc1'].update(acc1.item(), n=batch_valid_count)
+        #     metric_logger.meters['acc5'].update(acc5.item(), n=batch_valid_count)
+        # metric_logger.update(loss=loss.item())
 
-    with open(file, "w") as f:
-        f.write("video_id probabilities true_label chunk_nb split_nb\n")
-        for line in final_result:
-            f.write(line)
+    # with open(file, "w") as f:
+    #     f.write("video_id probabilities true_label chunk_nb split_nb\n")
+    #     for line in final_result:
+    #         f.write(line)
 
-    metric_logger.synchronize_between_processes()
-    print("* Test Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}"
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+    # metric_logger.synchronize_between_processes()
+    # print("* Test Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}"
+    #       .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
     
     # Combine probabilities from all batches
     all_probs = torch.cat(all_probs, dim=0)  # shape [N, C]
 
+
+    # Average results by chunk_id and split_id that correspond to same video
+    # Dictionary to store sums of probabilities and counts for averaging
+    prob_sums = defaultdict(lambda: torch.zeros(all_probs.shape[1]))  # Shape [C]
+    counts = defaultdict(int)
+    targets_map = {}
+
+    # Aggregate probabilities by video_id
+    for video_id, probs, target in zip(all_video_ids, all_probs, all_targets):
+        if video_id in targets_map and targets_map[video_id] != target:
+            raise ValueError(f"Inconsistent target for video_id {video_id}: {targets_map[video_id]} vs {target}")
+        
+        targets_map[video_id] = target
+        prob_sums[video_id] += probs
+        counts[video_id] += 1
+
+    print("all_probs original shape ", all_probs.shape)
+    print("all targets original shape ", len(all_targets))
+    # Compute averaged probabilities
+    new_all_probs = torch.stack([prob_sums[vid] / counts[vid] for vid in prob_sums.keys()])
+    new_all_targets = [targets_map[vid] for vid in prob_sums.keys()]
+
+    print("all_probs new shape ", new_all_probs.shape)
+    print("all targets new shape ", len(new_all_targets))
+
     ############################################################################
     # Compute Precision/Recall (using all samples, including negatives)
     ############################################################################
-    def compute_precision_recall_with_negatives(all_probs, all_targets, category_names, threshold=0.0001):
-        all_probs_np = all_probs.cpu().numpy()
-        all_targets_np = np.array(all_targets)
-        N, C = all_probs_np.shape
-        for c in range(C):
-            scores = all_probs_np[:, c]
-            # Include all samples for precision/recall computation
-            is_pos = (all_targets_np == c).astype(int)
-            predicted_pos = (scores >= threshold).astype(int)
-            tp = np.sum((predicted_pos == 1) & (is_pos == 1))
-            fp = np.sum((predicted_pos == 1) & (is_pos == 0))
-            fn = np.sum((predicted_pos == 0) & (is_pos == 1))
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            print(f"[Category {c} - {category_names.get(c, f'Cat {c}')}] Threshold={threshold:.2f}, "
-                  f"TP={tp}, FP={fp}, FN={fn}, Precision={precision*100:.2f}%, Recall={recall*100:.2f}%")
+    # def compute_precision_recall_with_negatives(all_probs, all_targets, category_names, threshold=0.0001):
+    #     all_probs_np = all_probs.cpu().numpy()
+    #     all_targets_np = np.array(all_targets)
+    #     N, C = all_probs_np.shape
+    #     for c in range(C):
+    #         scores = all_probs_np[:, c]
+    #         # Include all samples for precision/recall computation
+    #         is_pos = (all_targets_np == c).astype(int)
+    #         predicted_pos = (scores >= threshold).astype(int)
+    #         tp = np.sum((predicted_pos == 1) & (is_pos == 1))
+    #         fp = np.sum((predicted_pos == 1) & (is_pos == 0))
+    #         fn = np.sum((predicted_pos == 0) & (is_pos == 1))
+    #         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    #         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    #         print(f"[Category {c} - {category_names.get(c, f'Cat {c}')}] Threshold={threshold:.2f}, "
+    #               f"TP={tp}, FP={fp}, FN={fn}, Precision={precision*100:.2f}%, Recall={recall*100:.2f}%")
     
-    print("Precision/Recall on test set (threshold=0.5):")
-    compute_precision_recall_with_negatives(all_probs, all_targets, category_names, threshold=0.0001)
+    # print("Precision/Recall on test set (threshold=0.5):")
+    # compute_precision_recall_with_negatives(all_probs, all_targets, category_names, threshold=0.0001)
 
     ############################################################################
     # Compute per-class Average Precision (AP) using all samples (including negatives)
@@ -1675,29 +1706,29 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
             print(f"  AP for class {c} ({category_names.get(c, f'Cat {c}')}) : {ap:.4f}")
         print("End of per-class AP.\n")
     
-    compute_average_precision(all_probs, all_targets, category_names)
+    compute_average_precision(new_all_probs, new_all_targets, category_names)
 
     ############################################################################
     # Save confusion matrix using only valid (non -1) samples
     ############################################################################
-    valid_idx = [i for i, lbl in enumerate(all_targets) if lbl != -1]
-    valid_preds = [all_top1[i] for i in valid_idx]
-    valid_labels = [all_targets[i] for i in valid_idx]
-    cm = confusion_matrix(valid_labels, valid_preds)
-    plt.figure(figsize=(10, 8))
-    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title("Confusion Matrix - Final Test")
-    plt.colorbar()
-    tick_marks = np.arange(len(category_names))
-    plt.xticks(tick_marks, [category_names[i] for i in tick_marks], rotation=45, ha="right")
-    plt.yticks(tick_marks, [category_names[i] for i in tick_marks])
-    plt.ylabel("True Label")
-    plt.xlabel("Predicted Label")
-    plt.tight_layout()
-    cm_path = os.path.join(os.path.dirname(file), "test_confusion_matrix.png")
-    plt.savefig(cm_path)
-    print(f"[DEBUG] Saved final test confusion matrix to {cm_path}")
-    plt.close()
+    # valid_idx = [i for i, lbl in enumerate(all_targets) if lbl != -1]
+    # valid_preds = [all_top1[i] for i in valid_idx]
+    # valid_labels = [all_targets[i] for i in valid_idx]
+    # cm = confusion_matrix(valid_labels, valid_preds)
+    # plt.figure(figsize=(10, 8))
+    # plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    # plt.title("Confusion Matrix - Final Test")
+    # plt.colorbar()
+    # tick_marks = np.arange(len(category_names))
+    # plt.xticks(tick_marks, [category_names[i] for i in tick_marks], rotation=45, ha="right")
+    # plt.yticks(tick_marks, [category_names[i] for i in tick_marks])
+    # plt.ylabel("True Label")
+    # plt.xlabel("Predicted Label")
+    # plt.tight_layout()
+    # cm_path = os.path.join(os.path.dirname(file), "test_confusion_matrix.png")
+    # plt.savefig(cm_path)
+    # print(f"[DEBUG] Saved final test confusion matrix to {cm_path}")
+    # plt.close()
 
     safe_barrier()
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

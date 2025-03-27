@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='linear_probing_custom_distilled_B14_ft_k710_f8_3_18'
+JOB_NAME='linear_probing_B_model_custom_data_loader'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
@@ -25,6 +25,7 @@ python run_linear_probing.py \
     --data_path ${DATA_PATH} \
     --prefix ${PREFIX} \
     --data_set 'MyCustom' \
+    --nb_classes 6 \
     --finetune ${MODEL_PATH} \
     --log_dir ${OUTPUT_DIR} \
     --output_dir ${OUTPUT_DIR} \
@@ -34,7 +35,7 @@ python run_linear_probing.py \
     --input_size 224 \
     --short_side_size 224 \
     --save_ckpt_freq 100 \
-    --num_frames 16 \
+    --num_frames 8 \
     --orig_t_size 8 \
     --num_workers 2 \
     --warmup_epochs 0 \
@@ -51,7 +52,7 @@ python run_linear_probing.py \
     --opt adamw \
     --opt_betas 0.9 0.999 \
     --weight_decay 0 \
-    --test_num_segment 2 \
+    --test_num_segment 1 \
     --test_num_crop 3 \
     --dist_eval \
     --bf16 \
