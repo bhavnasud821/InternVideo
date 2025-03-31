@@ -1381,13 +1381,13 @@ def train_one_epoch(
 
         torch.cuda.synchronize()
 
-        if mixup_fn is None:
-            class_acc = (output.argmax(dim=-1) == targets).float().mean()
-        else:
-            class_acc = None
+        # if mixup_fn is None:
+        #     class_acc = (output.argmax(dim=-1) == targets).float().mean()
+        # else:
+        #     class_acc = None
 
         metric_logger.update(loss=loss_value)
-        metric_logger.update(class_acc=class_acc)
+        # metric_logger.update(class_acc=class_acc)
         metric_logger.update(loss_scale=loss_scale_value)
         min_lr, max_lr_val = 10., 0.
         for group in optimizer.param_groups:
@@ -1404,7 +1404,7 @@ def train_one_epoch(
 
         if log_writer is not None:
             log_writer.update(loss=loss_value, head="loss")
-            log_writer.update(class_acc=class_acc, head="loss")
+            # log_writer.update(class_acc=class_acc, head="loss")
             log_writer.update(loss_scale=loss_scale_value, head="opt")
             log_writer.update(lr=max_lr_val, head="opt")
             log_writer.update(min_lr=min_lr, head="opt")
@@ -1550,7 +1550,7 @@ def validation_one_epoch(data_loader, model, device, ds=False, bf16=False, outpu
 # FINAL TEST FUNCTIONS
 ############################################################################
 @torch.no_grad()
-def final_test(data_loader, model, device, file, ds=False, bf16=False):
+def final_test(data_loader, model, device, file, ds=False, bf16=False, multilabel=False):
     """
     Final evaluation after all epochs.
     Overall accuracy (top-1 and top-5) is computed ignoring negative samples (target == -1),
@@ -1562,7 +1562,6 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
     header = "Test:"
     model.eval()
 
-    final_result = []
     # all_top1 = []
     all_targets = []
     all_video_ids = []
@@ -1581,7 +1580,6 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
     }
 
     for batch in metric_logger.log_every(data_loader, 10, header):
-        print("batch ", batch[1:])
         videos, target = batch[0], batch[1]
         video_ids = batch[2] if len(batch) >= 3 else ["unknown"] * videos.shape[0]
         chunk_nb = batch[3]
@@ -1598,10 +1596,10 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
             loss = criterion(output[valid_mask], target[valid_mask])
         else:
             loss = torch.tensor(0.0, device=output.device)
-        print("target shape ", target.shape)
-        print("output shape ", output.shape)
-        probs = torch.softmax(output, dim=-1)
-        print("probs shape ", probs.shape)
+        if multilabel:
+            probs = torch.sigmoid(output)
+        else:
+            probs = torch.softmax(output, dim=-1)
         # top1_preds = output.argmax(dim=-1)
         # top5_scores, top5_preds = torch.topk(probs, 5, dim=-1)
 
@@ -1656,13 +1654,13 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
         counts[video_id] += 1
 
     print("all_probs original shape ", all_probs.shape)
-    print("all targets original shape ", len(all_targets))
+    print("all targets original len ", len(all_targets))
     # Compute averaged probabilities
     new_all_probs = torch.stack([prob_sums[vid] / counts[vid] for vid in prob_sums.keys()])
     new_all_targets = [targets_map[vid] for vid in prob_sums.keys()]
 
     print("all_probs new shape ", new_all_probs.shape)
-    print("all targets new shape ", len(new_all_targets))
+    print("all targets new len ", len(new_all_targets))
 
     ############################################################################
     # Compute Precision/Recall (using all samples, including negatives)
@@ -1690,23 +1688,38 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
     ############################################################################
     # Compute per-class Average Precision (AP) using all samples (including negatives)
     ############################################################################
-    def compute_average_precision(all_probs, all_targets, category_names):
+    def compute_average_precision(all_probs, all_targets, category_names, multilabel):
         # Convert tensor of probabilities to NumPy array
         all_probs_np = all_probs.cpu().numpy()
         all_targets_np = np.array(all_targets)
+        print("all probs np shape ", all_probs_np.shape)
+        print("all targets np shape ", all_targets_np.shape)
         C = all_probs_np.shape[1]
-        print("Per-class Average Precision (AP):")
-        for c in range(C):
-            is_pos = (all_targets_np == c).astype(int)
-            if np.sum(is_pos) == 0:
-                ap = 0.0
-            else:
-                scores = all_probs_np[:, c]
-                ap = average_precision_score(is_pos, scores)
-            print(f"  AP for class {c} ({category_names.get(c, f'Cat {c}')}) : {ap:.4f}")
+        average_ap = 0
+        if multilabel:
+            ap_per_class = average_precision_score(all_targets_np, all_probs_np, average=None)
+            print("ap per class shape ", ap_per_class.shape)
+            average_ap = np.mean(ap_per_class)
+            class_aps = {c: ap_per_class[c] for c in range(C)}
+            print(f"AP for all classes: {class_aps}")
+        else:
+            class_aps = {}
+            print("Per-class Average Precision (AP):")
+            for c in range(C):
+                is_pos = (all_targets_np == c).astype(int)
+                if np.sum(is_pos) == 0:
+                    ap = 0.0
+                else:
+                    scores = all_probs_np[:, c]
+                    ap = average_precision_score(is_pos, scores)
+                average_ap += ap
+                class_aps[c] = ap
+                print(f"  AP for class {c} ({category_names.get(c, f'Cat {c}')}) : {ap:.4f}")
+            average_ap /= C
         print("End of per-class AP.\n")
+        return average_ap, class_aps
     
-    compute_average_precision(new_all_probs, new_all_targets, category_names)
+    average_ap, class_aps = compute_average_precision(new_all_probs, new_all_targets, category_names, multilabel)
 
     ############################################################################
     # Save confusion matrix using only valid (non -1) samples
@@ -1731,7 +1744,8 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False):
     # plt.close()
 
     safe_barrier()
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    # return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return average_ap, class_aps
 
 ############################################################################
 # MERGE FUNCTION

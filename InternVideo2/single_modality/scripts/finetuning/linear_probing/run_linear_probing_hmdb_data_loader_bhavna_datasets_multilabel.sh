@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='linear_probing_B_model_custom_data_loader'
+JOB_NAME='linear_probing_B_model_hmdb_data_loader_bhavna_datasets_multilabel'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
@@ -19,12 +19,12 @@ GPUS=8
 GPUS_PER_NODE=8
 CPUS_PER_TASK=16
 
-# Command to run (using run_linear_probing.py)
+# Command to run
 python run_linear_probing.py \
     --model internvideo2_base_patch14_224 \
     --data_path ${DATA_PATH} \
     --prefix ${PREFIX} \
-    --data_set 'MyCustom' \
+    --data_set 'HMDB51' \
     --nb_classes 6 \
     --finetune ${MODEL_PATH} \
     --log_dir ${OUTPUT_DIR} \
@@ -40,7 +40,7 @@ python run_linear_probing.py \
     --num_workers 2 \
     --warmup_epochs 0 \
     --tubelet_size 1 \
-    --epochs 2 \
+    --epochs 20 \
     --lr 2e-3 \
     --min_lr 0 \
     --drop_path 0.0 \
@@ -53,8 +53,8 @@ python run_linear_probing.py \
     --opt_betas 0.9 0.999 \
     --weight_decay 0 \
     --test_num_segment 1 \
-    --test_num_crop 3 \
+    --test_num_crop 1 \
     --dist_eval \
     --bf16 \
     --zero_stage 1 \
-    # --test_best
+    --multilabel

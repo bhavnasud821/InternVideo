@@ -373,7 +373,10 @@ class HMDBVideoClsDataset(Dataset):
         import pandas as pd
         cleaned = pd.read_csv(self.anno_path, header=None, delimiter=",")
         self.dataset_samples = list(cleaned.values[:, 0])
-        self.label_array = list(cleaned.values[:, 1])
+        if args.multilabel:
+            self.label_array = cleaned.iloc[:, 1:].to_numpy()
+        else:
+            self.label_array = list(cleaned.values[:, 1])
 
         if (mode == 'train'):
             pass
@@ -438,8 +441,11 @@ class HMDBVideoClsDataset(Dataset):
                 return frame_list, label_list, index_list, {}
             else:
                 buffer = self._aug_frame(buffer, args)
-            
-            return buffer, self.label_array[index], index, {}
+            if args.multilabel:
+                return buffer, torch.tensor(self.label_array[index], dtype=torch.float32), index, {}
+            else:
+                return buffer, torch.tensor(self.label_array[index], dtype=torch.long), index, {}
+
 
         elif self.mode == 'validation':
             sample = self.dataset_samples[index]
@@ -472,8 +478,10 @@ class HMDBVideoClsDataset(Dataset):
             temporal_start = chunk_nb # 0/1
 
             if self.test_num_crop == 1:
-                buffer = buffer[temporal_start::2, \
+                buffer = buffer[:, 
                     :, :, :]
+                # buffer = buffer[temporal_start::2, \
+                #     :, :, :]
             else:
                 spatial_step = 1.0 * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size) \
                                     / (self.test_num_crop - 1)
@@ -486,7 +494,7 @@ class HMDBVideoClsDataset(Dataset):
                         :, spatial_start:spatial_start + self.short_side_size, :]
 
             buffer = self.data_transform(buffer)
-            return buffer, self.test_label_array[index], sample, \
+            return buffer, torch.tensor(self.test_label_array[index]), sample, \
                 chunk_nb, split_nb
             # return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
             #        chunk_nb, split_nb
@@ -585,13 +593,15 @@ class HMDBVideoClsDataset(Dataset):
             return []
 
         if self.mode == 'test':
-            tick = len(vr) / float(self.num_segment)
-            all_index = list(np.array([int(tick / 2.0 + tick * x) for x in range(self.num_segment)] +
-                               [int(tick * x) for x in range(self.num_segment)]))
-            while len(all_index) < (self.num_segment * self.test_num_segment):
-                all_index.append(all_index[-1])
-            all_index = np.sort(np.array(all_index))
-            vr.seek(0)
+            # tick = len(vr) / float(self.num_segment)
+            # all_index = list(np.array([int(tick / 2.0 + tick * x) for x in range(self.num_segment)] +
+            #                    [int(tick * x) for x in range(self.num_segment)]))
+            # while len(all_index) < (self.num_segment * self.test_num_segment):
+            #     all_index.append(all_index[-1])
+            # all_index = np.sort(np.array(all_index))
+            # vr.seek(0)
+            total_frames = len(vr)
+            all_index = np.linspace(0, total_frames - 1, self.num_segment, dtype=int).tolist()
             buffer = vr.get_batch(all_index).asnumpy()
             return buffer
         elif self.mode == 'validation':

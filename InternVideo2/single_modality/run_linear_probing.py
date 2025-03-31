@@ -14,6 +14,7 @@ from collections import OrderedDict
 from datasets.mixup import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from torch.nn import BCEWithLogitsLoss
 from timm.utils import ModelEma
 from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
 
@@ -42,6 +43,7 @@ def get_args():
     parser.set_defaults(use_ceph_checkpoint=False)
     parser.add_argument('--ceph_checkpoint_prefix', default='', type=str, help='prefix for checkpoint in ceph')
     parser.add_argument('--ckpt_path_split', default='/exp/', type=str, help='string for splitting the ckpt_path')
+    parser.add_argument('--multilabel', action='store_true', help="whether to use multilabel sigmoid loss training")
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
@@ -563,7 +565,9 @@ def main(args, ds_init):
     )
     print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
-    if mixup_fn is not None:
+    if args.multilabel:
+        criterion = BCEWithLogitsLoss()
+    elif mixup_fn is not None:
         criterion = SoftTargetCrossEntropy()
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
@@ -591,7 +595,7 @@ def main(args, ds_init):
 
     if args.eval:
         preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16)
+        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         # if global_rank == 0:
@@ -627,12 +631,15 @@ def main(args, ds_init):
                 ceph_args=ceph_args,
             )
         if data_loader_test is not None:
-            test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False, output_dir=args.output_dir)
-            print(f"test_stats: {test_stats}")
+            preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, ds=False, bf16=args.bf16, multilabel=args.multilabel)
+            print("Got average AP ", average_ap)
+            # test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False, output_dir=args.output_dir)
+            # print(f"test_stats: {test_stats}")
             timestep = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            print(f"[{timestep}] Accuracy of the network on the {len(dataset_test)} val videos: {test_stats['acc1']:.1f}%")
-            if max_accuracy < test_stats["acc1"]:
-                max_accuracy = test_stats["acc1"]
+            # print(f"[{timestep}] Accuracy of the network on the {len(dataset_test)} val videos: {test_stats['acc1']:.1f}%")
+            if max_accuracy < average_ap:
+                max_accuracy = average_ap
                 if args.output_dir and args.save_ckpt:
                     utils.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
@@ -640,21 +647,26 @@ def main(args, ds_init):
                         ceph_args=ceph_args,
                     )
             print(f'Max accuracy: {max_accuracy:.2f}%')
-            if log_writer is not None:
-                log_writer.update(val_acc1=test_stats['acc1'], head="perf", step=epoch)
-                log_writer.update(val_acc5=test_stats['acc5'], head="perf", step=epoch)
-                log_writer.update(val_loss=test_stats['loss'], head="perf", step=epoch)
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         **{f'val_{k}': v for k, v in test_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
+            # if log_writer is not None:
+                # log_writer.update(average_ap=average_ap, head="perf", step=epoch)
+                # log_writer.update(val_acc1=test_stats['acc1'], head="perf", step=epoch)
+                # log_writer.update(val_acc5=test_stats['acc5'], head="perf", step=epoch)
+                # log_writer.update(val_loss=test_stats['loss'], head="perf", step=epoch)
+            log_stats = {
+                "class_aps": class_aps,
+                "average_ap": average_ap
+            }
+            # log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+            #              **{f'val_{k}': v for k, v in test_stats.items()},
+            #              'epoch': epoch,
+            #              'n_parameters': n_parameters}
         else:
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch,
                          'n_parameters': n_parameters}
         if args.output_dir and utils.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
+            # if log_writer is not None:
+            #     log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
@@ -667,7 +679,7 @@ def main(args, ds_init):
             optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
             ceph_args=ceph_args,
         )
-    test_stats = final_test(data_loader_test, model, device, preds_file, ds=False, bf16=args.bf16)
+    average_ap = final_test(data_loader_test, model, device, preds_file, ds=False, bf16=args.bf16, multilabel=args.multilabel)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     # if global_rank == 0:
