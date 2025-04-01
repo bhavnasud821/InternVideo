@@ -20,7 +20,7 @@ GPUS_PER_NODE=8
 CPUS_PER_TASK=16
 
 # Command to run
-python run_linear_probing.py \
+python run_linear_probing_inference.py \
     --model internvideo2_base_patch14_224 \
     --data_path ${DATA_PATH} \
     --prefix ${PREFIX} \
@@ -58,4 +58,4 @@ python run_linear_probing.py \
     --bf16 \
     --zero_stage 1 \
     --smoothing 0 \
-    --internal_test
+    --sample_path test_videos/Lead_Climbing_Roof_at_Stoneworks_climb_f_cm_np1_ba_med_1.mp4

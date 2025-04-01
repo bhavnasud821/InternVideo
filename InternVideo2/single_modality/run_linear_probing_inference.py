@@ -10,6 +10,7 @@ import os
 from functools import partial
 from pathlib import Path
 from collections import OrderedDict
+import imageio
 
 from datasets.mixup import Mixup
 from timm.models import create_model
@@ -23,16 +24,50 @@ from datasets import build_dataset
 from engines.engine_for_finetuning import train_one_epoch, validation_one_epoch, final_test, merge
 # from engines.engine_for_finetuning import train_one_epoch, validation_one_epoch, final_test, merge
 from utils import NativeScalerWithGradNormCount as NativeScaler
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, InterpolationMode
 from utils import multiple_samples_collate
 import utils
 from models import *
+from PIL import Image
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['RDMAV_FORK_SAFE'] = '1'
 
+def loadvideo_decord(sample_path, num_frames, crop_size):
+        try:
+            from decord import VideoReader, cpu
+        except ImportError:
+            raise ImportError("Please install decord via 'pip install decord'")
+        fname = sample_path
+        try:
+            vr = VideoReader(fname, num_threads=1, ctx=cpu(0))
+        except Exception as e:
+            print("Video cannot be loaded by decord:", fname)
+            return []
+        total_frames = len(vr)
+        if total_frames == 0:
+            return []
+        if total_frames < num_frames:
+            indices = list(range(total_frames)) + [total_frames - 1] * (num_frames - total_frames)
+        else:
+            indices = np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
+        try:
+            buffer = vr.get_batch(indices).asnumpy()
+            import cv2
+            resized = []
+            for frame in buffer:
+                frame_resized = cv2.resize(frame, (crop_size, crop_size))
+                resized.append(frame_resized)
+            buffer = np.stack(resized, axis=0)
+        except Exception as e:
+            print("Error loading frames from video:", fname)
+            return []
+        return buffer
+
 def get_args():
     parser = argparse.ArgumentParser('VideoMAE fine-tuning and evaluation script for video classification', add_help=False)
     # Add all your existing arguments here (for brevity, not all are reprinted below)
+    parser.add_argument('--sample_path', type=str)
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--test_batch_size', default=64, type=int)
     parser.add_argument('--epochs', default=30, type=int)
@@ -91,7 +126,7 @@ def get_args():
     parser.set_defaults(open_clip_projector=False)
     parser.add_argument('--open_block_num', type=int, default=0, help="whether open the last few blocks")
     parser.add_argument("--gpu", type=int, default=0, help="GPU id to use for training (default: 0)")
-    
+
     # Augmentation parameters
     parser.add_argument('--color_jitter', type=float, default=0.4, metavar='PCT', help='Color jitter factor (default: 0.4)')
     parser.add_argument('--num_sample', type=int, default=2, help='Repeated_aug (default: 2)')
@@ -185,9 +220,6 @@ def get_args():
     parser.add_argument('--bf16', default=False, action='store_false')
     parser.add_argument('--zero_stage', default=0, type=int, help='ZeRO optimizer stage (default: 0)')
 
-    # Testing group
-    parser.add_argument('--internal_test', action='store_true')
-
     known_args, _ = parser.parse_known_args()
 
     if known_args.enable_deepspeed:
@@ -221,84 +253,7 @@ def main(args, ds_init):
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    dataset_train, args.nb_classes = build_dataset(is_train=True, test_mode=False, args=args)
-    # if args.disable_eval_during_finetuning:
-    #     dataset_val = None
-    # else:
-    #     dataset_val, _ = build_dataset(is_train=False, test_mode=False, args=args)
-    dataset_test, _ = build_dataset(is_train=False, test_mode=True, args=args)
-    
-    num_tasks = utils.get_world_size()
-    global_rank = utils.get_rank()
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
-    print("Sampler_train = %s" % str(sampler_train))
-    # if args.dist_eval:
-    #     if len(dataset_val) % num_tasks != 0:
-    #         print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-    #               'This may alter validation results slightly.')
-        # sampler_val = torch.utils.data.DistributedSampler(
-        #     dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-    sampler_test = torch.utils.data.DistributedSampler(
-        dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-    # else:
-    #     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-
-    if global_rank == 0 and args.log_dir is not None:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
-    else:
-        log_writer = None
-
-    if args.num_sample > 1:
-        collate_func = partial(utils.multiple_samples_collate, fold=False)
-    else:
-        collate_func = None
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-        collate_fn=collate_func,
-        persistent_workers=True
-    )
-
-    # if dataset_val is not None:
-    #     data_loader_val = torch.utils.data.DataLoader(
-    #         dataset_val, sampler=sampler_val,
-    #         batch_size=args.test_batch_size,
-    #         num_workers=args.num_workers,
-    #         pin_memory=args.pin_mem,
-    #         drop_last=False,
-    #         persistent_workers=True
-    #     )
-    # else:
-    data_loader_val = None
-
-    if dataset_test is not None:
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test, sampler=sampler_test,
-            batch_size=args.test_batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            persistent_workers=True
-        )
-    else:
-        data_loader_test = None
-
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
-
+    # Load the model
     if 'cat' in args.model:
         model = create_model(
             args.model,
@@ -512,18 +467,6 @@ def main(args, ds_init):
     print("Model = %s" % str(model_without_ddp))
     print('number of params:', n_parameters)
 
-    total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-    num_training_steps_per_epoch = len(dataset_train) // total_batch_size
-    args.lr = args.lr * total_batch_size * args.num_sample / 256
-    args.min_lr = args.min_lr * total_batch_size * args.num_sample / 256
-    args.warmup_lr = args.warmup_lr * total_batch_size * args.num_sample / 256
-    print("LR = %.8f" % args.lr)
-    print("Batch size = %d" % total_batch_size)
-    print("Repeated sample = %d" % args.num_sample)
-    print("Update frequent = %d" % args.update_freq)
-    print("Number of training examples = %d" % len(dataset_train))
-    print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
-
     num_layers = model_without_ddp.get_num_layers()
     if args.layer_decay < 1.0:
         assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
@@ -536,51 +479,6 @@ def main(args, ds_init):
     skip_weight_decay_list = model.no_weight_decay()
     print("Skip weight decay list: ", skip_weight_decay_list)
 
-    if args.enable_deepspeed:
-        loss_scaler = None
-        optimizer_params = get_parameter_groups(
-            model, args.weight_decay, skip_weight_decay_list,
-            assigner.get_layer_id if assigner is not None else None,
-            assigner.get_scale if assigner is not None else None
-        )
-        model, optimizer, _, _ = ds_init(
-            args=args, model=model, model_parameters=optimizer_params, dist_init_required=not args.distributed,
-        )
-        print("model.gradient_accumulation_steps() = %d" % model.gradient_accumulation_steps())
-        assert model.gradient_accumulation_steps() == args.update_freq
-    else:
-        if args.distributed:
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-            model_without_ddp = model.module
-        optimizer = create_optimizer(
-            args, model_without_ddp, skip_list=skip_weight_decay_list,
-            get_num_layer=assigner.get_layer_id if assigner is not None else None,
-            get_layer_scale=assigner.get_scale if assigner is not None else None
-        )
-        loss_scaler = NativeScaler()
-
-    print("Use step level LR scheduler!")
-    lr_schedule_values = utils.cosine_scheduler(
-        args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
-        warmup_epochs=args.warmup_epochs, start_warmup_value=args.warmup_lr, warmup_steps=args.warmup_steps,
-    )
-    if args.weight_decay_end is None:
-        args.weight_decay_end = args.weight_decay
-    wd_schedule_values = utils.cosine_scheduler(
-        args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch
-    )
-    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
-
-    if args.multilabel:
-        criterion = BCEWithLogitsLoss()
-    elif mixup_fn is not None:
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing > 0.:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
-
-    print("criterion = %s" % str(criterion))
     ceph_args = {
         'use_ceph_checkpoint': args.use_ceph_checkpoint,
         'ceph_checkpoint_prefix': args.ceph_checkpoint_prefix,
@@ -594,115 +492,49 @@ def main(args, ds_init):
     print("start epoch before auto load model ", args.start_epoch)
     utils.auto_load_model(
         args=args, model=model, model_without_ddp=model_without_ddp,
-        optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
+        optimizer=None, loss_scaler=None, model_ema=model_ema,
         ceph_args=ceph_args,
     )
     print("start epoch after auto load model ", args.start_epoch)
 
+
+
+    # Load the sample video
+    sample = args.sample_path
+    buffer = loadvideo_decord(sample, args.num_frames, args.input_size)
+    # Instead of passing the numpy array directly, convert each frame to PIL, apply resize then transform.
+    transformed_frames = []
+
+    data_resize = Compose([
+        Resize((args.input_size, args.input_size), interpolation=InterpolationMode.BILINEAR)
+    ])
+    data_transform = Compose([
+        ToTensor(),
+    ])
+    for i in range(buffer.shape[0]):
+        pil_img = Image.fromarray(buffer[i])
+        resized_img = data_resize(pil_img)  # Apply Resize transform.
+        transformed_img = data_transform(resized_img)  # Apply ToTensor transform.
+        transformed_frames.append(transformed_img)
     
-    print(f"Use bf16 {args.bf16}")
 
-    if args.eval:
-        preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        # if global_rank == 0:
-        #     print("Start merging results...")
-        #     final_top1, final_top5 = merge(args.output_dir, num_tasks)
-        #     print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
-        #     log_stats = {'Final top-1': final_top1, 'Final Top-5': final_top5}
-        #     if args.output_dir and utils.is_main_process():
-        #         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-        #             f.write(json.dumps(log_stats) + "\n")
-        exit(0)
-        
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-    max_accuracy = 0.0
-    print("start epoch is ", args.start_epoch)
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-        if log_writer is not None:
-            log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer,
-            device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
-            log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
-            lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-            num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            bf16=args.bf16
-        )
-        if args.output_dir and args.save_ckpt:
-            utils.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch, model_name='latest', model_ema=model_ema,
-                ceph_args=ceph_args,
-            )
-        if data_loader_test is not None:
-            preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
-            print("Got average AP ", average_ap)
-            # test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False, output_dir=args.output_dir)
-            # print(f"test_stats: {test_stats}")
-            timestep = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            # print(f"[{timestep}] Accuracy of the network on the {len(dataset_test)} val videos: {test_stats['acc1']:.1f}%")
-            if max_accuracy < average_ap:
-                max_accuracy = average_ap
-                if args.output_dir and args.save_ckpt:
-                    utils.save_model(
-                        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                        loss_scaler=loss_scaler, epoch=epoch, model_name='best', model_ema=model_ema,
-                        ceph_args=ceph_args,
-                    )
-            print(f'Max accuracy: {max_accuracy:.2f}%')
-            # if log_writer is not None:
-                # log_writer.update(average_ap=average_ap, head="perf", step=epoch)
-                # log_writer.update(val_acc1=test_stats['acc1'], head="perf", step=epoch)
-                # log_writer.update(val_acc5=test_stats['acc5'], head="perf", step=epoch)
-                # log_writer.update(val_loss=test_stats['loss'], head="perf", step=epoch)
-            log_stats = {
-                "class_aps": class_aps,
-                "average_ap": average_ap
-            }
-            # log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-            #              **{f'val_{k}': v for k, v in test_stats.items()},
-            #              'epoch': epoch,
-            #              'n_parameters': n_parameters}
-        else:
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
-        if args.output_dir and utils.is_main_process():
-            # if log_writer is not None:
-            #     log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+    # Convert frames to numpy format for visualization
+    frames_np = [frame.squeeze().permute(1, 2, 0).cpu().numpy() for frame in transformed_frames]  # Convert [C, H, W] -> [H, W, C]
+    frames_np = [(frame * 255).astype(np.uint8) for frame in frames_np]  # Ensure values are in range [0, 255]
 
-    preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-    if args.test_best:
-        print("Auto testing the best model")
-        args.eval = True
-        utils.auto_load_model(
-            args=args, model=model, model_without_ddp=model_without_ddp,
-            optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
-            ceph_args=ceph_args,
-        )
-    average_ap = final_test(data_loader_test, model, device, preds_file, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-    # if global_rank == 0:
-    #     print("Start merging results...")
-    #     final_top1, final_top5 = merge(args.output_dir, num_tasks)
-    #     print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
-    #     log_stats = {'Final top-1': final_top1, 'Final Top-5': final_top5}
-    #     if args.output_dir and utils.is_main_process():
-    #         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-    #             f.write(json.dumps(log_stats) + "\n")
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    # Save as GIF
+    gif_path = args.sample_path[:-4] + ".gif"
+    imageio.mimsave(gif_path, frames_np, fps=10)  # Adjust fps as needed
+
+    frames = torch.stack(transformed_frames, dim=0)  # [T, C, H, W]
+    frames = frames.permute(1, 0, 2, 3)  # [C, T, H, W]
+    videos = frames.unsqueeze(0)
+    videos = videos.to(device, non_blocking=True)
+
+    outputs = model(videos)
+    print("outputs ", outputs)
+    softmax_outputs = torch.softmax(outputs, dim=-1)
+    print("softmax outputs ", softmax_outputs)
 
 
 if __name__ == '__main__':
