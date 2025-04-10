@@ -143,9 +143,9 @@ def build_dataset(is_train, test_mode, args):
         else:
             path_prefix = ""
         if args.multilabel:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel.csv")
+            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel_cleaned_2.csv")
         else:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna.csv")
+            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned_2.csv")
         if args.use_decord:
             func = HMDBVideoClsDataset
         else:
@@ -220,9 +220,9 @@ def build_dataset(is_train, test_mode, args):
         else:
             path_prefix = ""
         if args.multilabel:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel.csv")
+            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel_cleaned_2.csv")
         else:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna.csv")
+            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned_2.csv")
         dataset = CustomVideoClsDatasetNumeric(
             anno_path=anno_path,
             prefix=args.prefix,

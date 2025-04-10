@@ -324,7 +324,8 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False, multilabe
         2: "climbing over fence/gate/wall",
         3: "actively taking objects",
         4: "running or showing urgency",
-        5: "fall_floor"
+        5: "fall_floor",
+        6: "vandalism"
     }
 
     for batch in metric_logger.log_every(data_loader, 10, header):

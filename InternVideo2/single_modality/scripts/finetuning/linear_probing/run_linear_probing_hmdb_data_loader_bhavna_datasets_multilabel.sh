@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='linear_probing_B_model_hmdb_data_loader_bhavna_datasets_multilabel'
+JOB_NAME='linear_probing_B_model_hmdb_data_loader_bhavna_datasets_multilabel_cleaned'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
@@ -25,7 +25,7 @@ python run_linear_probing.py \
     --data_path ${DATA_PATH} \
     --prefix ${PREFIX} \
     --data_set 'HMDB51' \
-    --nb_classes 6 \
+    --nb_classes 7 \
     --finetune ${MODEL_PATH} \
     --log_dir ${OUTPUT_DIR} \
     --output_dir ${OUTPUT_DIR} \
@@ -57,4 +57,5 @@ python run_linear_probing.py \
     --dist_eval \
     --bf16 \
     --zero_stage 1 \
+    --smoothing 0 \
     --multilabel

@@ -58,4 +58,4 @@ python run_linear_probing_inference.py \
     --bf16 \
     --zero_stage 1 \
     --smoothing 0 \
-    --sample_path test_videos/Lead_Climbing_Roof_at_Stoneworks_climb_f_cm_np1_ba_med_1.mp4
+    --sample_path test_videos/The_Fugitive_5_climb_f_cm_np1_ri_med_8.mp4
