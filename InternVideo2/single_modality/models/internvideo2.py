@@ -556,6 +556,7 @@ class InternVideo2(nn.Module):
 
 @register_model
 def internvideo2_base_patch14_224(pretrained=False, **kwargs):
+    print("kwargs ", kwargs)
     model = InternVideo2(
         img_size=224, patch_size=14, embed_dim=768, 
         depth=12, num_heads=12, mlp_ratio=4, 

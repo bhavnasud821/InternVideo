@@ -44,6 +44,7 @@ def get_args():
     parser.add_argument('--ceph_checkpoint_prefix', default='', type=str, help='prefix for checkpoint in ceph')
     parser.add_argument('--ckpt_path_split', default='/exp/', type=str, help='string for splitting the ckpt_path')
     parser.add_argument('--multilabel', action='store_true', help="whether to use multilabel sigmoid loss training")
+    parser.add_argument('--grayscale', action='store_true', help='whether to train with grayscale videos')
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
@@ -317,6 +318,7 @@ def main(args, ds_init):
             layerscale_no_force_fp32=args.layerscale_no_force_fp32,
             merge_method=args.merge_method,
             merge_norm=args.merge_norm,
+            in_chans=1 if args.grayscale else 3
         )
     else:
         model = create_model(
@@ -334,6 +336,7 @@ def main(args, ds_init):
             init_scale=args.init_scale,
             init_values=args.layer_scale_init_value,
             layerscale_no_force_fp32=args.layer_scale_init_value,
+            in_chans=1 if args.grayscale else 3
         )
 
     patch_size = model.patch_embed.patch_size
@@ -343,8 +346,6 @@ def main(args, ds_init):
                         args.input_size // patch_size[1])
     args.patch_size = patch_size
 
-    print("start epoch here is ", args.start_epoch)
-    print("finetune is ", args.finetune)
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -604,7 +605,7 @@ def main(args, ds_init):
 
     if args.eval:
         preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
+        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         # if global_rank == 0:
@@ -642,7 +643,7 @@ def main(args, ds_init):
             )
         if data_loader_test is not None:
             preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
+            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
             print("Got average AP ", average_ap)
             # test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False, output_dir=args.output_dir)
             # print(f"test_stats: {test_stats}")
@@ -689,7 +690,7 @@ def main(args, ds_init):
             optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
             ceph_args=ceph_args,
         )
-    average_ap = final_test(data_loader_test, model, device, preds_file, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
+    average_ap = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     # if global_rank == 0:

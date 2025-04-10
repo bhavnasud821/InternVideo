@@ -288,7 +288,7 @@ def blend(images1, images2, alpha):
     return images1 * alpha + images2 * (1 - alpha)
 
 
-def grayscale(images):
+def grayscale(images, bgr=True):
     """
     Get the grayscale for the input images. The channels of images should be
     in order BGR.
@@ -301,9 +301,14 @@ def grayscale(images):
     """
     # R -> 0.299, G -> 0.587, B -> 0.114.
     img_gray = torch.tensor(images)
-    gray_channel = (
-        0.299 * images[:, 2] + 0.587 * images[:, 1] + 0.114 * images[:, 0]
-    )
+    if bgr:
+        gray_channel = (
+            0.299 * images[:, 2] + 0.587 * images[:, 1] + 0.114 * images[:, 0]
+        )
+    else:
+        gray_channel = (
+            0.299 * images[:, 0] + 0.587 * images[:, 1] + 0.114 * images[:, 2]
+        )
     img_gray[:, 0] = gray_channel
     img_gray[:, 1] = gray_channel
     img_gray[:, 2] = gray_channel

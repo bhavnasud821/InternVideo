@@ -298,7 +298,7 @@ def validation_one_epoch(data_loader, model, device, ds=False, bf16=False, outpu
 # FINAL TEST FUNCTIONS
 ############################################################################
 @torch.no_grad()
-def final_test(data_loader, model, device, file, ds=False, bf16=False, multilabel=False, output_dir=None):
+def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=False, multilabel=False, output_dir=None):
     """
     Final evaluation after all epochs.
     Overall accuracy (top-1 and top-5) is computed ignoring negative samples (target == -1),
@@ -335,6 +335,7 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False, multilabe
         split_nb = batch[4]
 
         videos = videos.to(device, non_blocking=True)
+        print("videos shape ",videos.shape)
         target = target.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type='cuda'):
@@ -395,11 +396,13 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False, multilabe
 
     # Aggregate probabilities by video_id
     for video_id, probs, target in zip(all_video_ids, all_probs, all_targets):
-        if video_id in targets_map and targets_map[video_id] != target:
-            # TODO: better deal with video having multiple classes
-            raise ValueError(f"Inconsistent target for video_id {video_id}: {targets_map[video_id]} vs {target}")
-        
-        targets_map[video_id] = target
+        if multilabel:
+            targets_map[video_id] = target
+        else:
+            if video_id not in targets_map:
+                targets_map[video_id] = np.zeros(num_classes, dtype=np.float32)
+            if target != -1:
+                targets_map[video_id][target] = 1.0
         prob_sums[video_id] += probs
         counts[video_id] += 1
 
@@ -423,44 +426,44 @@ def final_test(data_loader, model, device, file, ds=False, bf16=False, multilabe
         print("all targets np shape ", all_targets_np.shape)
         C = all_probs_np.shape[1]
         average_ap = 0
-        if multilabel:
-            ap_per_class = average_precision_score(all_targets_np, all_probs_np, average=None)
-            print("ap per class shape ", ap_per_class.shape)
-            average_ap = np.mean(ap_per_class)
-            class_aps = {c: ap_per_class[c] for c in range(C)}
-            print(f"AP for all classes: {class_aps}")
-        else:
-            class_aps = {}
-            print("Per-class Average Precision (AP):")
-            for c in range(C):
-                is_pos = (all_targets_np == c).astype(int)
-                if np.sum(is_pos) == 0:
-                    ap = 0.0
-                    precision, recall = [1, 0], [0, 1]  # Default PR curve for empty class
-                else:
-                    scores = all_probs_np[:, c]
-                    if c == 0:
-                        print("scores is ", scores)
-                    ap = average_precision_score(is_pos, scores)
-                    print("Output dir is ", output_dir)
-                    if output_dir:
-                        precision, recall, _ = precision_recall_curve(is_pos, scores)
-                        # Plot Precision-Recall curve
-                        plt.figure(figsize=(6, 5))
-                        plt.plot(recall, precision, marker='.', label=f'Class {c}: {category_names.get(c, f"Cat {c}")}')
-                        plt.xlabel('Recall')
-                        plt.ylabel('Precision')
-                        plt.title(f'Precision-Recall Curve for Class {c}')
-                        plt.legend()
-                        plt.grid()
-                        save_path = os.path.join(output_dir, f'pr_curve_class_{c}.png')
-                        plt.savefig(save_path, dpi=300)
-                        print("saved figure to ", save_path)
-                        plt.close()  # Close the figure to free memory
-                average_ap += ap
-                class_aps[c] = ap
-                print(f"  AP for class {c} ({category_names.get(c, f'Cat {c}')}) : {ap:.4f}")
-            average_ap /= C
+        # if multilabel:
+        ap_per_class = average_precision_score(all_targets_np, all_probs_np, average=None)
+        print("ap per class shape ", ap_per_class.shape)
+        average_ap = np.mean(ap_per_class)
+        class_aps = {c: ap_per_class[c] for c in range(C)}
+        print(f"AP for all classes: {class_aps}")
+        # else:
+        #     class_aps = {}
+        #     print("Per-class Average Precision (AP):")
+        #     for c in range(C):
+        #         is_pos = (all_targets_np == c).astype(int)
+        #         if np.sum(is_pos) == 0:
+        #             ap = 0.0
+        #             precision, recall = [1, 0], [0, 1]  # Default PR curve for empty class
+        #         else:
+        #             scores = all_probs_np[:, c]
+        #             if c == 6:
+        #                 print("scores is ", scores)
+        #             ap = average_precision_score(is_pos, scores)
+        #             print("Output dir is ", output_dir)
+        #             if output_dir:
+        #                 precision, recall, _ = precision_recall_curve(is_pos, scores)
+        #                 # Plot Precision-Recall curve
+        #                 plt.figure(figsize=(6, 5))
+        #                 plt.plot(recall, precision, marker='.', label=f'Class {c}: {category_names.get(c, f"Cat {c}")}')
+        #                 plt.xlabel('Recall')
+        #                 plt.ylabel('Precision')
+        #                 plt.title(f'Precision-Recall Curve for Class {c}')
+        #                 plt.legend()
+        #                 plt.grid()
+        #                 save_path = os.path.join(output_dir, f'pr_curve_class_{c}.png')
+        #                 plt.savefig(save_path, dpi=300)
+        #                 print("saved figure to ", save_path)
+        #                 plt.close()  # Close the figure to free memory
+        #         average_ap += ap
+        #         class_aps[c] = ap
+        #         print(f"  AP for class {c} ({category_names.get(c, f'Cat {c}')}) : {ap:.4f}")
+        #     average_ap /= C
         print("End of per-class AP.\n")
         return average_ap, class_aps
     

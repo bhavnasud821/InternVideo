@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from .random_erasing import RandomErasing
 from .video_transforms import (
     Compose, UniformResize, Resize, CenterCrop, Normalize,
-    create_random_augment, random_short_side_scale_jitter, 
+    create_random_augment, grayscale, random_short_side_scale_jitter,
     random_crop, random_resized_crop_with_shift, random_resized_crop,
     horizontal_flip, random_short_side_scale_jitter, uniform_crop, 
 )
@@ -333,6 +333,17 @@ class HMDBRawFrameClsDataset(Dataset):
         else:
             return len(self.test_dataset)
 
+class GrayScaleTransform:
+    def __call__(self, tensor):
+        tensor = torch.unsqueeze(grayscale(tensor, bgr=False)[:, 0], 1)
+        return tensor
+
+class Permute:
+    def __init__(self, order):
+        self.order = order
+
+    def __call__(self, tensor):
+        return tensor.permute(*self.order)
 
 class HMDBVideoClsDataset(Dataset):
     """Load your own video classification dataset."""
@@ -398,11 +409,23 @@ class HMDBVideoClsDataset(Dataset):
                 self.data_resize = Compose([
                     Resize(size=(short_side_size), interpolation='bilinear')
                 ])
-            self.data_transform = Compose([
-                ClipToTensor(),
-                Normalize(mean=[0.485, 0.456, 0.406],
-                                        std=[0.229, 0.224, 0.225])
-            ])
+            if args.grayscale:
+                self.data_transform = Compose([
+                    ClipToTensor(),
+                    # convert from (c, n, h, w) to (n, c, h, w)
+                    Permute((1, 0, 2, 3)),
+                    GrayScaleTransform(), # (n, 1, h, w)
+                    # convert from (n, 1, h, w) to (1, n, h, w)
+                    Permute((1, 0, 2, 3)),
+                    Normalize(mean=[0.5],
+                                        std=[0.5])
+                ])
+            else:
+                self.data_transform = Compose([
+                    ClipToTensor(),
+                    Normalize(mean=[0.485, 0.456, 0.406],
+                                            std=[0.229, 0.224, 0.225])
+                ])
             self.test_seg = []
             self.test_dataset = []
             self.test_label_array = []
@@ -521,12 +544,19 @@ class HMDBVideoClsDataset(Dataset):
 
         buffer = [transforms.ToTensor()(img) for img in buffer]
         buffer = torch.stack(buffer) # T C H W
+        if args.grayscale:
+            buffer = torch.unsqueeze(grayscale(buffer, bgr=False)[:, 0], 1)
         buffer = buffer.permute(0, 2, 3, 1) # T H W C 
-        
-        # T H W C 
-        buffer = tensor_normalize(
-            buffer, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-        )
+
+        if args.grayscale:
+            buffer = tensor_normalize(
+                buffer, [0.5], [0.5]
+            )
+        else:
+            # T H W C
+            buffer = tensor_normalize(
+                buffer, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+            )
         # T H W C -> C T H W.
         buffer = buffer.permute(3, 0, 1, 2)
         # Perform data augmentation.
