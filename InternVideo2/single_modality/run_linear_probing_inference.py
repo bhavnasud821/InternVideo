@@ -523,8 +523,8 @@ def main(args, ds_init):
     frames_np = [(frame * 255).astype(np.uint8) for frame in frames_np]  # Ensure values are in range [0, 255]
 
     # Save as GIF
-    gif_path = args.sample_path[:-4] + ".gif"
-    imageio.mimsave(gif_path, frames_np, fps=10)  # Adjust fps as needed
+    # gif_path = args.sample_path[:-4] + ".gif"
+    # imageio.mimsave(gif_path, frames_np, fps=10)  # Adjust fps as needed
 
     frames = torch.stack(transformed_frames, dim=0)  # [T, C, H, W]
     frames = frames.permute(1, 0, 2, 3)  # [C, T, H, W]

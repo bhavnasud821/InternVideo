@@ -6,27 +6,27 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-# JOB_NAME='linear_probing_B_model_hmdb_data_loader_no_mixup_no_smoothing_bhavna_datasets'
-JOB_NAME='linear_probing_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_larger_including_negative_category'
+JOB_NAME='attentive_probing_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_larger_including_negative_category_higher_internal_weight'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
 DATA_PATH='/home/saumya/internal_vids'   # Directory containing CSV annotation files and videos
 MODEL_PATH='/home/saumya/pytorch_model_distilled_B14_ft_k710_f8.bin'    # Path to pretrained checkpoint
-
+# MODEL_PATH='/home/saumya/pytorch_model_distilled_B14_original.bin'
 # GPU and CPU configurations
 PARTITION='video'
 GPUS=8
 GPUS_PER_NODE=8
 CPUS_PER_TASK=16
 
-# Command to run
-python run_linear_probing_inference.py \
+# Command to runc
+python run_linear_probing.py \
+    --open_clip_projector \
     --model internvideo2_base_patch14_224 \
     --data_path ${DATA_PATH} \
     --prefix ${PREFIX} \
     --data_set 'HMDB51' \
-    --nb_classes 8 \
+    --nb_classes 7 \
     --finetune ${MODEL_PATH} \
     --log_dir ${OUTPUT_DIR} \
     --output_dir ${OUTPUT_DIR} \
@@ -59,4 +59,6 @@ python run_linear_probing_inference.py \
     --bf16 \
     --zero_stage 1 \
     --smoothing 0 \
-    --sample_path /home/saumya/internal_vids/new_model_comb_extracted_tracks_2/249ee058-142c-496f-8172-511ad6bef283_combined.mp4
+    --gpu 1 \
+    --include_negative_category \
+    --internal_loss_scale 2.0

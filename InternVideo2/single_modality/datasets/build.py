@@ -145,7 +145,10 @@ def build_dataset(is_train, test_mode, args):
         if args.multilabel:
             anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel_cleaned_2.csv")
         else:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned_2.csv")
+            if args.include_negative_category:
+                anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_with_negative_cleaned_2.csv")
+            else:
+                anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned_2.csv")
         if args.use_decord:
             func = HMDBVideoClsDataset
         else:
@@ -167,6 +170,9 @@ def build_dataset(is_train, test_mode, args):
             new_width=320,
             filename_tmpl=args.filename_tmpl,
             args=args)
+        # check is_train to avoid updating nb_classes twice
+        if args.include_negative_category and is_train:
+            args.nb_classes += 1
         nb_classes = 51 if not args.nb_classes else args.nb_classes
     elif args.data_set in ['ANet', 'HACS', 'ANet_interval', 'HACS_interval']:
         mode = 'train' if is_train else ('test' if test_mode else 'validation')
@@ -236,7 +242,7 @@ def build_dataset(is_train, test_mode, args):
             filename_tmpl=args.filename_tmpl,
             args=args
         )
-        nb_classes = 6
+        nb_classes = args.nb_classes
     else:
         print(f'Unsupported dataset: {args.data_set}')
         raise NotImplementedError()

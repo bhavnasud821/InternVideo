@@ -610,7 +610,7 @@ def main(args, ds_init):
 
     if args.eval:
         preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16)
+        test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, output_dir=args.output_dir)
         torch.distributed.barrier()
         if global_rank == 0:
             print("Start merging results...")
@@ -694,7 +694,7 @@ def main(args, ds_init):
             optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
             ceph_args=ceph_args,
         )
-    test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16)
+    test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, output_dir=args.output_dir)
     torch.distributed.barrier()
     if global_rank == 0:
         print("Start merging results...")

@@ -45,6 +45,8 @@ def get_args():
     parser.add_argument('--ckpt_path_split', default='/exp/', type=str, help='string for splitting the ckpt_path')
     parser.add_argument('--multilabel', action='store_true', help="whether to use multilabel sigmoid loss training")
     parser.add_argument('--grayscale', action='store_true', help='whether to train with grayscale videos')
+    parser.add_argument('--include_negative_category', action='store_true', help='whether to include a negative category for single label model training')
+    parser.add_argument('--internal_loss_scale', type=float, default=1.0, help='How much to scale internal data during training')
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
@@ -300,6 +302,7 @@ def main(args, ds_init):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
+    print("nb classes before creating model ", args.nb_classes)
     if 'cat' in args.model:
         model = create_model(
             args.model,
@@ -573,13 +576,13 @@ def main(args, ds_init):
     print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
     if args.multilabel:
-        criterion = BCEWithLogitsLoss()
+        criterion = BCEWithLogitsLoss(reduction='none')
     elif mixup_fn is not None:
         criterion = SoftTargetCrossEntropy()
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.CrossEntropyLoss(reduction='none')
 
     print("criterion = %s" % str(criterion))
     ceph_args = {
@@ -604,7 +607,7 @@ def main(args, ds_init):
     print(f"Use bf16 {args.bf16}")
 
     if args.eval:
-        preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+        preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
         average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -633,7 +636,7 @@ def main(args, ds_init):
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            bf16=args.bf16
+            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale
         )
         if args.output_dir and args.save_ckpt:
             utils.save_model(
@@ -642,10 +645,10 @@ def main(args, ds_init):
                 ceph_args=ceph_args,
             )
         if data_loader_test is not None:
-            preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+            preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
             average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
             print("Got average AP ", average_ap)
-            # test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False, output_dir=args.output_dir)
+            # test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False)
             # print(f"test_stats: {test_stats}")
             timestep = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             # print(f"[{timestep}] Accuracy of the network on the {len(dataset_test)} val videos: {test_stats['acc1']:.1f}%")
@@ -681,7 +684,7 @@ def main(args, ds_init):
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+    preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
     if args.test_best:
         print("Auto testing the best model")
         args.eval = True

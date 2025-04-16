@@ -13,6 +13,8 @@ from datasets.mixup import Mixup
 from timm.utils import accuracy, ModelEma
 import utils
 from scipy.special import softmax
+from PIL import Image
+
 
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, average_precision_score, precision_recall_curve
@@ -54,7 +56,8 @@ def train_one_epoch(
     wd_schedule_values=None,
     num_training_steps_per_epoch=None,
     update_freq=None,
-    bf16=False
+    bf16=False,
+    internal_loss_scale=1.0
 ):
     model.train(True)
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -69,7 +72,8 @@ def train_one_epoch(
     else:
         optimizer.zero_grad()
 
-    for data_iter_step, (samples, targets, _, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, targets, _, info) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        paths = info["path"]
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
             continue
@@ -92,10 +96,20 @@ def train_one_epoch(
 
         if loss_scaler is None:
             samples = samples.bfloat16() if bf16 else samples.half()
-            loss, output = train_class_batch(model, samples, targets, criterion)
+            losses, output = train_class_batch(model, samples, targets, criterion)
         else:
             with torch.amp.autocast(device_type='cuda'):
-                loss, output = train_class_batch(model, samples, targets, criterion)
+                losses, output = train_class_batch(model, samples, targets, criterion)
+
+        # Scale internal data by loss_scale
+        loss_scales = []
+        for path in paths:
+            if "comb_extracted_tracks" in path:
+                loss_scales.append(internal_loss_scale)
+            else:
+                loss_scales.append(1.0)
+        loss_scales = torch.tensor(loss_scales).to(device, non_blocking=True)
+        loss = (losses * loss_scales).mean()
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -328,11 +342,11 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         6: "vandalism"
     }
 
+    final_result = []
     for batch in metric_logger.log_every(data_loader, 10, header):
-        videos, target = batch[0], batch[1]
-        video_ids = batch[2] if len(batch) >= 3 else ["unknown"] * videos.shape[0]
-        chunk_nb = batch[3]
-        split_nb = batch[4]
+        original_videos, videos, target = batch[0], batch[1], batch[2]
+        video_ids = batch[3] if len(batch) >= 4 else ["unknown"] * videos.shape[0]
+        segment_indices = batch[4]
 
         videos = videos.to(device, non_blocking=True)
         print("videos shape ",videos.shape)
@@ -340,12 +354,6 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
 
         with torch.amp.autocast(device_type='cuda'):
             output = model(videos)
-        # Compute loss only on valid samples:
-        valid_mask = (target != -1)
-        if valid_mask.sum() > 0:
-            loss = criterion(output[valid_mask], target[valid_mask])
-        else:
-            loss = torch.tensor(0.0, device=output.device)
         if multilabel:
             probs = torch.sigmoid(output)
         else:
@@ -360,11 +368,24 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         # all_top5.extend(top5_preds.cpu().tolist())
         all_probs.append(probs.cpu())
 
-        # # Save per-sample predictions (JSON-serialized) for merging
-        # for i in range(output.size(0)):
-        #     prob_json = json.dumps(output.data[i].float().cpu().numpy().tolist())
-        #     line = f"{video_ids[i]} {prob_json} {int(target[i].cpu().numpy())} {str(int(chunk_nb[i].cpu().numpy()))} {str(int(split_nb[i].cpu().numpy()))}\n"
-        #     final_result.append(line)
+        # Save per-sample predictions (JSON-serialized) for merging
+        for i in range(output.size(0)):
+            prob_json = json.dumps(probs.data[i].float().cpu().numpy().tolist())
+            line = f"{video_ids[i]} {segment_indices[i]} {prob_json} {int(target[i].cpu().numpy())}\n"
+            final_result.append(line)
+            # # save input image
+            # rows, cols = 2, 4
+            # h, w = 224, 224
+            # grid = Image.new('RGB', (cols * w, rows * h))
+
+            # for j in range(8):
+            #     img = Image.fromarray(original_videos[i].numpy()[j])
+            #     grid.paste(img, ((j % cols) * w, (j // cols) * h))
+            # save_path = f"{output_dir}/{video_ids[i]}_{segment_indices[i]}_image_grid.png"
+            # parent_dir = os.path.dirname(save_path)
+
+            # os.makedirs(parent_dir, exist_ok=True)
+            # grid.save(save_path)
 
         # if valid_mask.sum() > 0:
         #     valid_outputs = output[valid_mask]
@@ -375,10 +396,10 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         #     metric_logger.meters['acc5'].update(acc5.item(), n=batch_valid_count)
         # metric_logger.update(loss=loss.item())
 
-    # with open(file, "w") as f:
-    #     f.write("video_id probabilities true_label chunk_nb split_nb\n")
-    #     for line in final_result:
-    #         f.write(line)
+    with open(file, "w") as f:
+        f.write("video_id segment_idx probabilities true_label\n")
+        for line in final_result:
+            f.write(line)
 
     # metric_logger.synchronize_between_processes()
     # print("* Test Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}"
@@ -391,6 +412,7 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
     # Average results by chunk_id and split_id that correspond to same video
     # Dictionary to store sums of probabilities and counts for averaging
     prob_sums = defaultdict(lambda: torch.zeros(all_probs.shape[1]))  # Shape [C]
+    prob_maxes = defaultdict(lambda: torch.zeros(all_probs.shape[1]))  # Shape [C]
     counts = defaultdict(int)
     targets_map = {}
 
@@ -403,13 +425,19 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
                 targets_map[video_id] = np.zeros(num_classes, dtype=np.float32)
             if target != -1:
                 targets_map[video_id][target] = 1.0
+        # TODO: try max prob for video segments rather than averaging
         prob_sums[video_id] += probs
+        if video_id in prob_maxes:
+            prob_maxes[video_id] = torch.max(prob_maxes[video_id], probs)
+        else:
+            prob_maxes[video_id] = probs 
         counts[video_id] += 1
 
     print("all_probs original shape ", all_probs.shape)
     print("all targets original len ", len(all_targets))
     # Compute averaged probabilities
-    new_all_probs = torch.stack([prob_sums[vid] / counts[vid] for vid in prob_sums.keys()])
+    # new_all_probs = torch.stack([prob_sums[vid] / counts[vid] for vid in prob_sums.keys()])
+    new_all_probs = torch.stack([prob_maxes[vid] for vid in prob_sums.keys()])
     new_all_targets = [targets_map[vid] for vid in prob_sums.keys()]
 
     print("all_probs new shape ", new_all_probs.shape)

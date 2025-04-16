@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='linear_probing_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_grayscale'
+JOB_NAME='linear_probing_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_larger_including_negative_category_higher_internal_weight'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
@@ -59,4 +59,6 @@ python run_linear_probing.py \
     --zero_stage 1 \
     --smoothing 0 \
     --gpu 1 \
-    --grayscale
+    --include_negative_category \
+    --internal_loss_scale 2.0 \
+    --internal_test

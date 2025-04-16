@@ -345,6 +345,16 @@ class Permute:
     def __call__(self, tensor):
         return tensor.permute(*self.order)
 
+def get_video_info(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {video_path}")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)                 # Frame rate
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  # Total number of frames
+    cap.release()
+    return fps, frame_count
+
 class HMDBVideoClsDataset(Dataset):
     """Load your own video classification dataset."""
 
@@ -417,8 +427,8 @@ class HMDBVideoClsDataset(Dataset):
                     GrayScaleTransform(), # (n, 1, h, w)
                     # convert from (n, 1, h, w) to (1, n, h, w)
                     Permute((1, 0, 2, 3)),
-                    Normalize(mean=[0.5],
-                                        std=[0.5])
+                    Normalize(mean=[0.456],
+                                        std=[0.224])
                 ])
             else:
                 self.data_transform = Compose([
@@ -429,13 +439,31 @@ class HMDBVideoClsDataset(Dataset):
             self.test_seg = []
             self.test_dataset = []
             self.test_label_array = []
-            for ck in range(self.test_num_segment):
-                for cp in range(self.test_num_crop):
-                    for idx in range(len(self.label_array)):
-                        sample_label = self.label_array[idx]
+            for idx in range(len(self.label_array)):
+                sample_label = self.label_array[idx]
+                sample = self.dataset_samples[idx]
+                fname = os.path.join(self.prefix, sample)
+                try:
+                    fps, frame_count = get_video_info(fname)
+                    if frame_count < 100:
+                        num_segments = 1
+                    else:
+                        num_frames_3_point_2_seconds = int(fps * 3.2)
+                        num_segments = int(frame_count / num_frames_3_point_2_seconds)
+                    for s in range(num_segments):
                         self.test_label_array.append(sample_label)
-                        self.test_dataset.append(self.dataset_samples[idx])
-                        self.test_seg.append((ck, cp))
+                        self.test_dataset.append(sample)
+                        self.test_seg.append(s)
+                except IOError as e:
+                    print("Skipping video ", sample)
+
+            # for ck in range(self.test_num_segment):
+            #     for cp in range(self.test_num_crop):
+            #         for idx in range(len(self.label_array)):
+            #             sample_label = self.label_array[idx]
+            #             self.test_label_array.append(sample_label)
+            #             self.test_dataset.append(self.dataset_samples[idx])
+            #             self.test_seg.append((ck, cp))
 
     def __getitem__(self, index):
         if self.mode == 'train':
@@ -465,62 +493,22 @@ class HMDBVideoClsDataset(Dataset):
             else:
                 buffer = self._aug_frame(buffer, args)
             if args.multilabel:
-                return buffer, torch.tensor(self.label_array[index], dtype=torch.float32), index, {}
+                return buffer, torch.tensor(self.label_array[index], dtype=torch.float32), index, {"path": sample}
             else:
-                return buffer, torch.tensor(self.label_array[index], dtype=torch.long), index, {}
-
-
-        elif self.mode == 'validation':
-            sample = self.dataset_samples[index]
-            buffer = self.loadvideo_decord(sample)
-            if len(buffer) == 0:
-                while len(buffer) == 0:
-                    warnings.warn("video {} not correctly loaded during validation".format(sample))
-                    index = np.random.randint(self.__len__())
-                    sample = self.dataset_samples[index]
-                    buffer = self.loadvideo_decord(sample)
-            buffer = self.data_transform(buffer)
-            return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0]
+                return buffer, torch.tensor(self.label_array[index], dtype=torch.long), index, {"path": sample}
 
         elif self.mode == 'test':
             sample = self.test_dataset[index]
-            chunk_nb, split_nb = self.test_seg[index]
-            buffer = self.loadvideo_decord(sample)
-
-            while len(buffer) == 0:
-                warnings.warn("video {}, temporal {}, spatial {} not found during testing".format(\
-                    str(self.test_dataset[index]), chunk_nb, split_nb))
-                index = np.random.randint(self.__len__())
-                sample = self.test_dataset[index]
-                chunk_nb, split_nb = self.test_seg[index]
-                buffer = self.loadvideo_decord(sample)
+            segment_idx = self.test_seg[index]
+            buffer = self.loadvideo_decord(sample, segment_idx=segment_idx)
 
             buffer = self.data_resize(buffer)
             if isinstance(buffer, list):
                 buffer = np.stack(buffer, 0)
-            temporal_start = chunk_nb # 0/1
-
-            if self.test_num_crop == 1:
-                buffer = buffer[:, 
-                    :, :, :]
-                # buffer = buffer[temporal_start::2, \
-                #     :, :, :]
-            else:
-                spatial_step = 1.0 * (max(buffer.shape[1], buffer.shape[2]) - self.short_side_size) \
-                                    / (self.test_num_crop - 1)
-                spatial_start = int(split_nb * spatial_step)
-                if buffer.shape[1] >= buffer.shape[2]:
-                    buffer = buffer[temporal_start::2, \
-                        spatial_start:spatial_start + self.short_side_size, :, :]
-                else:
-                    buffer = buffer[temporal_start::2, \
-                        :, spatial_start:spatial_start + self.short_side_size, :]
-
-            buffer = self.data_transform(buffer)
-            return buffer, torch.tensor(self.test_label_array[index]), sample, \
-                chunk_nb, split_nb
-            # return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
-            #        chunk_nb, split_nb
+                transformed_buffer = self.data_transform(buffer)
+            return buffer, transformed_buffer, torch.tensor(self.test_label_array[index]), sample, \
+                segment_idx
+            
         else:
             raise NameError('mode {} unkown'.format(self.mode))
 
@@ -550,7 +538,7 @@ class HMDBVideoClsDataset(Dataset):
 
         if args.grayscale:
             buffer = tensor_normalize(
-                buffer, [0.5], [0.5]
+                buffer, [0.456], [0.224]
             )
         else:
             # T H W C
@@ -593,7 +581,7 @@ class HMDBVideoClsDataset(Dataset):
         return buffer
 
 
-    def loadvideo_decord(self, sample, sample_rate_scale=1):
+    def loadvideo_decord(self, sample, sample_rate_scale=1, segment_idx=0):
         """Load video content using Decord"""
         fname = sample
         fname = os.path.join(self.prefix, fname)
@@ -631,9 +619,23 @@ class HMDBVideoClsDataset(Dataset):
             # all_index = np.sort(np.array(all_index))
             # vr.seek(0)
             total_frames = len(vr)
-            all_index = np.linspace(0, total_frames - 1, self.num_segment, dtype=int).tolist()
-            buffer = vr.get_batch(all_index).asnumpy()
-            return buffer
+            if total_frames < 100:
+                all_index = np.linspace(0, total_frames - 1, self.num_segment, dtype=int).tolist()
+                buffer = vr.get_batch(all_index).asnumpy()
+                return buffer
+            else:
+                # get the correct 3.2 second chunk
+                try:
+                    num_frames_3_point_2_seconds = int(vr.get_avg_fps() * 3.2)
+                    start_frame = segment_idx * num_frames_3_point_2_seconds
+                    all_index = np.linspace(start_frame, min(start_frame + num_frames_3_point_2_seconds, total_frames - 1), self.num_segment, dtype=int).tolist()
+                    buffer = vr.get_batch(all_index).asnumpy()
+                    return buffer
+                except Exception as e:
+                    print("segment idx is ", segment_idx, "num frames 3.2 is ", num_frames_3_point_2_seconds, " frame rate is ", vr.get_avg_fps(), " and total frames is ", total_frames)
+                    raise e
+
+
         elif self.mode == 'validation':
             tick = len(vr) / float(self.num_segment)
             all_index = np.array([int(tick / 2.0 + tick * x) for x in range(self.num_segment)])
