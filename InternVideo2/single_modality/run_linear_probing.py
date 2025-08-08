@@ -47,6 +47,22 @@ def get_args():
     parser.add_argument('--grayscale', action='store_true', help='whether to train with grayscale videos')
     parser.add_argument('--include_negative_category', action='store_true', help='whether to include a negative category for single label model training')
     parser.add_argument('--internal_loss_scale', type=float, default=1.0, help='How much to scale internal data during training')
+    parser.add_argument('--test_anno_path', type=str, default=None)
+    parser.add_argument('--train_anno_path', type=str, default=None)
+    parser.add_argument('--save_training_images', action='store_true')
+    parser.add_argument('--test_combined_cropped', action='store_true', help='Whether to test on the data that was cropped to people in view')
+    parser.add_argument('--train_combined_cropped', action='store_true', help='Whether to train on the data that was cropped to people in view')
+    parser.add_argument('--enable_class_weights', action='store_true', help='Whether to weight loss by amount of data from the class')
+    parser.add_argument('--min_padding_ratio_positive', type=float, default=0.1, help='min amount to expand bbox around people during training (positive)')
+    parser.add_argument('--max_padding_ratio_positive', type=float, default=0.5, help='max amount to expand bbox around people during training (positive)')
+    parser.add_argument('--min_padding_ratio_negative', type=float, default=0.1, help='min amount to expand bbox around people during training (negative)')
+    parser.add_argument('--max_padding_ratio_negative', type=float, default=0.5, help='max amount to expand bbox around people during training (negative)')
+    parser.add_argument('--test_padding_ratio', type=float, default=0.1, help='amount to expand bbox around people during testing')
+    parser.add_argument('--eval_yolo_crops', action='store_true', help='Whether to use yolo crops for evaluation, otherwise use the crops from labeled activity')
+    parser.add_argument('--train_yolo_crops', action='store_true', help='Whether to use yolo crops for training, otherwise use the crops from labeled activity')
+    parser.add_argument('--use_random_yolo_crop', action='store_true', help='Whether to randomly switch between yolo crops and labeled activity crops during training')
+    parser.add_argument('--spatial_augmentation_min_scale', type=float, default=0.08, help='Minimum scale for spatial augmentation')
+    parser.add_argument('--new_spatial_augmentation', action='store_true', help='Whether to apply new spatial augmentation to create random bbox that must included activity/people')
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
@@ -215,7 +231,7 @@ def main(args, ds_init):
 
     print(args)
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     print("DEBUG: Using device: %s", device)
     
     # Set seed for reproducibility
@@ -582,7 +598,20 @@ def main(args, ds_init):
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        class_counts = dataset_train.class_counts
+        print("class counts ", class_counts)
+        # Compute weights: inverse of frequency (add epsilon to avoid div by 0)
+        epsilon = 1e-6
+        class_weights = 1.0 / (class_counts + epsilon)
+        class_weights = class_weights / class_weights.sum()
+        class_weights = class_weights.to(device)
+        print("class weights ", class_weights)
+        if args.enable_class_weights:
+            criterion = torch.nn.CrossEntropyLoss(reduction='none', weight=class_weights)
+        else:
+            criterion = torch.nn.CrossEntropyLoss(reduction='none')
+
+
 
     print("criterion = %s" % str(criterion))
     ceph_args = {
@@ -608,7 +637,8 @@ def main(args, ds_init):
 
     if args.eval:
         preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
-        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
+        internal = "internal_test" in args.test_anno_path
+        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         # if global_rank == 0:
@@ -636,7 +666,7 @@ def main(args, ds_init):
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale
+            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale, multilabel=args.multilabel
         )
         if args.output_dir and args.save_ckpt:
             utils.save_model(
@@ -646,7 +676,8 @@ def main(args, ds_init):
             )
         if data_loader_test is not None:
             preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
-            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
+            internal = "internal_test" in args.test_anno_path
+            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
             print("Got average AP ", average_ap)
             # test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False)
             # print(f"test_stats: {test_stats}")
@@ -693,7 +724,8 @@ def main(args, ds_init):
             optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
             ceph_args=ceph_args,
         )
-    average_ap = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir)
+    internal = "internal_test" in args.test_anno_path
+    average_ap = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     # if global_rank == 0:

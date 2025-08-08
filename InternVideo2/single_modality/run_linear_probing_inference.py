@@ -10,6 +10,11 @@ import os
 from functools import partial
 from pathlib import Path
 from collections import OrderedDict
+import cv2
+import glob
+import csv
+import io
+from decord import VideoReader, cpu
 import imageio
 
 from datasets.mixup import Mixup
@@ -24,45 +29,14 @@ from datasets import build_dataset
 from engines.engine_for_finetuning import train_one_epoch, validation_one_epoch, final_test, merge
 # from engines.engine_for_finetuning import train_one_epoch, validation_one_epoch, final_test, merge
 from utils import NativeScalerWithGradNormCount as NativeScaler
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, InterpolationMode
-from utils import multiple_samples_collate
+from datasets.video_transforms import Compose, UniformResize, Normalize
+from datasets.volume_transforms import ClipToTensor
 import utils
 from models import *
 from PIL import Image
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['RDMAV_FORK_SAFE'] = '1'
-
-def loadvideo_decord(sample_path, num_frames, crop_size):
-        try:
-            from decord import VideoReader, cpu
-        except ImportError:
-            raise ImportError("Please install decord via 'pip install decord'")
-        fname = sample_path
-        try:
-            vr = VideoReader(fname, num_threads=1, ctx=cpu(0))
-        except Exception as e:
-            print("Video cannot be loaded by decord:", fname)
-            return []
-        total_frames = len(vr)
-        if total_frames == 0:
-            return []
-        if total_frames < num_frames:
-            indices = list(range(total_frames)) + [total_frames - 1] * (num_frames - total_frames)
-        else:
-            indices = np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
-        try:
-            buffer = vr.get_batch(indices).asnumpy()
-            import cv2
-            resized = []
-            for frame in buffer:
-                frame_resized = cv2.resize(frame, (crop_size, crop_size))
-                resized.append(frame_resized)
-            buffer = np.stack(resized, axis=0)
-        except Exception as e:
-            print("Error loading frames from video:", fname)
-            return []
-        return buffer
 
 def get_args():
     parser = argparse.ArgumentParser('VideoMAE fine-tuning and evaluation script for video classification', add_help=False)
@@ -236,6 +210,41 @@ def get_args():
 
     return parser.parse_args(), ds_init
 
+def loadvideo_decord(fname, num_segment=8, sample_rate_scale=1, segment_idx=0):
+    """Load video content using Decord"""
+    try:
+        vr = VideoReader(fname, num_threads=1, ctx=cpu(0))
+    except:
+        print("video cannot be loaded by decord: ", fname)
+        return []
+
+    total_frames = len(vr)
+    # if total_frames < 100:
+    all_index = np.linspace(0, total_frames - 1, num_segment, dtype=int).tolist()
+    buffer = vr.get_batch(all_index).asnumpy()
+    return buffer
+    # else:
+    #     # get the correct 3.2 second chunk
+    #     try:
+    #         num_frames_3_point_2_seconds = int(vr.get_avg_fps() * 3.2)
+    #         start_frame = segment_idx * num_frames_3_point_2_seconds
+    #         all_index = np.linspace(start_frame, min(start_frame + num_frames_3_point_2_seconds, total_frames - 1), num_segment, dtype=int).tolist()
+    #         buffer = vr.get_batch(all_index).asnumpy()
+    #         return buffer
+    #     except Exception as e:
+    #         print("segment idx is ", segment_idx, "num frames 3.2 is ", num_frames_3_point_2_seconds, " frame rate is ", vr.get_avg_fps(), " and total frames is ", total_frames)
+    #         raise e
+
+def get_video_info(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {video_path}")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)                 # Frame rate
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  # Total number of frames
+    cap.release()
+    return fps, frame_count
+
 def main(args, ds_init):
     utils.init_distributed_mode(args)
 
@@ -244,7 +253,7 @@ def main(args, ds_init):
 
     print(args)
 
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print("DEBUG: Using device: %s", device)
     
     # Set seed for reproducibility
@@ -253,59 +262,295 @@ def main(args, ds_init):
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    # Load the model
-    if 'cat' in args.model:
-        model = create_model(
-            args.model,
-            pretrained=False,
-            num_classes=args.nb_classes,
-            num_frames=args.num_frames * args.num_segments,
-            tubelet_size=args.tubelet_size,
-            sep_pos_embed=args.sep_pos_embed,
-            fc_drop_rate=args.fc_drop_rate,
-            drop_path_rate=args.drop_path,
-            head_drop_path_rate=args.head_drop_path,
-            use_checkpoint=args.use_checkpoint,
-            checkpoint_num=args.checkpoint_num,
-            init_scale=args.init_scale,
-            init_values=args.layer_scale_init_value,
-            layerscale_no_force_fp32=args.layerscale_no_force_fp32,
-            merge_method=args.merge_method,
-            merge_norm=args.merge_norm,
-        )
+    # # Load the model
+    # if 'cat' in args.model:
+    #     model = create_model(
+    #         args.model,
+    #         pretrained=False,
+    #         num_classes=args.nb_classes,
+    #         num_frames=args.num_frames * args.num_segments,
+    #         tubelet_size=args.tubelet_size,
+    #         sep_pos_embed=args.sep_pos_embed,
+    #         fc_drop_rate=args.fc_drop_rate,
+    #         drop_path_rate=args.drop_path,
+    #         head_drop_path_rate=args.head_drop_path,
+    #         use_checkpoint=args.use_checkpoint,
+    #         checkpoint_num=args.checkpoint_num,
+    #         init_scale=args.init_scale,
+    #         init_values=args.layer_scale_init_value,
+    #         layerscale_no_force_fp32=args.layerscale_no_force_fp32,
+    #         merge_method=args.merge_method,
+    #         merge_norm=args.merge_norm,
+    #     )
+    # else:
+    #     model = create_model(
+    #         args.model,
+    #         pretrained=False,
+    #         num_classes=args.nb_classes,
+    #         num_frames=args.num_frames * args.num_segments,
+    #         tubelet_size=args.tubelet_size,
+    #         sep_pos_embed=args.sep_pos_embed,
+    #         fc_drop_rate=args.fc_drop_rate,
+    #         drop_path_rate=args.drop_path,
+    #         head_drop_path_rate=args.head_drop_path,
+    #         use_checkpoint=args.use_checkpoint,
+    #         checkpoint_num=args.checkpoint_num,
+    #         init_scale=args.init_scale,
+    #         init_values=args.layer_scale_init_value,
+    #         layerscale_no_force_fp32=args.layer_scale_init_value,
+    #     )
+
+    # patch_size = model.patch_embed.patch_size
+    # print("Patch size = %s" % str(patch_size))
+    # args.window_size = (args.num_frames // args.tubelet_size,
+    #                     args.input_size // patch_size[0],
+    #                     args.input_size // patch_size[1])
+    # args.patch_size = patch_size
+
+    # print("start epoch here is ", args.start_epoch)
+    # print("finetune is ", args.finetune)
+    # if args.finetune:
+    #     if args.finetune.startswith('https'):
+    #         checkpoint = torch.hub.load_state_dict_from_url(
+    #             args.finetune, map_location='cpu', check_hash=True)
+    #     else:
+    #         checkpoint = torch.load(args.finetune, map_location='cpu')
+    #     print("Load ckpt from %s" % args.finetune)
+    #     checkpoint_model = None
+    #     for model_key in args.model_key.split('|'):
+    #         if model_key in checkpoint:
+    #             checkpoint_model = checkpoint[model_key]
+    #             print("Load state_dict by model_key = %s" % model_key)
+    #             break
+    #     if checkpoint_model is None:
+    #         checkpoint_model = checkpoint
+
+    #     if 'head.weight' in checkpoint_model.keys():
+    #         if args.delete_head:
+    #             print("Removing head from pretrained checkpoint")
+    #             del checkpoint_model['head.weight']
+    #             del checkpoint_model['head.bias']
+    #         elif checkpoint_model['head.weight'].shape[0] == 710:
+    #             if args.nb_classes == 400:
+    #                 checkpoint_model['head.weight'] = checkpoint_model['head.weight'][:args.nb_classes]
+    #                 checkpoint_model['head.bias'] = checkpoint_model['head.bias'][:args.nb_classes]
+    #             elif args.nb_classes in [600, 700]:
+    #                 map_path = f'./k710/label_mixto{args.nb_classes}.json'
+    #                 print(f'Load label map from {map_path}')
+    #                 with open(map_path) as f:
+    #                     label_map = json.load(f)
+    #                 checkpoint_model['head.weight'] = checkpoint_model['head.weight'][label_map]
+    #                 checkpoint_model['head.bias'] = checkpoint_model['head.bias'][label_map]
+    #     all_keys = list(checkpoint_model.keys())
+    #     new_dict = OrderedDict()
+    #     for key in all_keys:
+    #         if key.startswith('backbone.'):
+    #             new_dict[key[9:]] = checkpoint_model[key]
+    #         elif key.startswith('encoder.'):
+    #             new_dict[key[8:]] = checkpoint_model[key]
+    #         else:
+    #             new_dict[key] = checkpoint_model[key]
+    #     checkpoint_model = new_dict
+        
+    #     print("finetune extra is ", args.finetune_extra)
+    #     if args.finetune_extra:
+    #         extra_checkpoint = torch.load(args.finetune_extra, map_location='cpu')
+    #         print("Load extra ckpt from %s" % args.finetune_extra)
+    #         extra_checkpoint_model = None
+    #         for model_key in args.model_key.split('|'):
+    #             if model_key in extra_checkpoint:
+    #                 extra_checkpoint_model = extra_checkpoint[model_key]
+    #                 print("Load state_dict by model_key = %s" % model_key)
+    #                 break
+    #         for k, v in extra_checkpoint_model.items():
+    #             new_k = k
+    #             if k.startswith('vision_encoder.'):
+    #                 new_k = k.replace('vision_encoder.', '')
+    #             else:
+    #                 print(f"Ignore keys: {k}")
+    #                 continue
+    #             checkpoint_model[new_k] = v
+
+    #     if 'pos_embed' in checkpoint_model:
+    #         pos_embed_checkpoint = checkpoint_model['pos_embed']
+    #         embedding_size = pos_embed_checkpoint.shape[-1]
+    #         num_patches = model.patch_embed.num_patches
+    #         num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+    #         orig_t_size = args.orig_t_size
+    #         new_t_size = args.num_frames * args.num_segments // model.patch_embed.tubelet_size
+    #         orig_size = int(((pos_embed_checkpoint.shape[-2] - num_extra_tokens) // orig_t_size) ** 0.5)
+    #         new_size = int((num_patches // new_t_size) ** 0.5)
+    #         if orig_t_size != new_t_size:
+    #             print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
+    #             extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+    #             pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+    #             pos_tokens = pos_tokens.view(1, orig_t_size, -1, embedding_size)
+    #             pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, embedding_size, orig_t_size)
+    #             pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=new_t_size, mode='linear')
+    #             pos_tokens = pos_tokens.view(1, -1, embedding_size, new_t_size)
+    #             pos_tokens = pos_tokens.permute(0, 3, 1, 2).reshape(1, -1, embedding_size)
+    #             new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+    #             checkpoint_model['pos_embed'] = new_pos_embed
+    #             pos_embed_checkpoint = new_pos_embed
+    #         if orig_size != new_size:
+    #             print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+    #             extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+    #             pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+    #             pos_tokens = pos_tokens.reshape(-1, new_t_size, orig_size, orig_size, embedding_size)
+    #             pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+    #             pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+    #             pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size)
+    #             pos_tokens = pos_tokens.flatten(1, 3)
+    #             new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+    #             checkpoint_model['pos_embed'] = new_pos_embed
+    #     elif 'pos_embed_spatial' in checkpoint_model and 'pos_embed_temporal' in checkpoint_model:
+    #         pos_embed_spatial_checkpoint = checkpoint_model['pos_embed_spatial']
+    #         pos_embed_temporal_checkpoint = checkpoint_model['pos_embed_temporal']
+    #         embedding_size = pos_embed_spatial_checkpoint.shape[-1]
+    #         num_patches = model.patch_embed.num_patches
+    #         orig_t_size = pos_embed_temporal_checkpoint.shape[-2]
+    #         new_t_size = args.num_frames // model.patch_embed.tubelet_size
+    #         orig_size = int(pos_embed_spatial_checkpoint.shape[-2] ** 0.5)
+    #         new_size = int((num_patches // new_t_size) ** 0.5)
+    #         if orig_t_size != new_t_size:
+    #             print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
+    #             tmp_pos_embed = pos_embed_temporal_checkpoint.view(1, orig_t_size, -1, embedding_size)
+    #             tmp_pos_embed = tmp_pos_embed.permute(0, 2, 3, 1).reshape(-1, embedding_size, orig_t_size)
+    #             tmp_pos_embed = torch.nn.functional.interpolate(tmp_pos_embed, size=new_t_size, mode='linear')
+    #             tmp_pos_embed = tmp_pos_embed.view(1, -1, embedding_size, new_t_size)
+    #             tmp_pos_embed = tmp_pos_embed.permute(0, 3, 1, 2).reshape(1, -1, embedding_size)
+    #             checkpoint_model['pos_embed_temporal'] = tmp_pos_embed
+    #         if orig_size != new_size:
+    #             print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+    #             pos_tokens = pos_embed_spatial_checkpoint
+    #             pos_tokens = pos_tokens.reshape(-1, new_t_size, orig_size, orig_size, embedding_size)
+    #             pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+    #             pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+    #             pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size)
+    #             pos_tokens = pos_tokens.flatten(1, 3)
+    #             checkpoint_model['pos_embed_spatial'] = pos_tokens
+
+    #     utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
+
+    # model.to(device)
+
+    # print("Freeze backbone for linear probing")
+    # if '6B' in args.model:
+    #     depth = 48
+    # else:
+    #     depth = 40  # ViT-g
+    # block_num_list = [(depth - i - 1) for i in range(args.open_block_num)]
+    # for name, p in model.named_parameters():
+    #     if name.startswith('patch_embed') or name.startswith('pos_embed') or name.startswith('cls_token'):
+    #         print(f"Freeze {name}")
+    #         p.requires_grad = False
+    #     elif name.startswith('blocks'):
+    #         flag = True
+    #         for num in block_num_list:
+    #             if name.startswith(f'blocks.{num}'):
+    #                 flag = False
+    #                 break
+    #         if flag:
+    #             print(f"Freeze {name}")
+    #             p.requires_grad = False
+    #         else:
+    #             print(f"Unfreeze {name}")
+    #     elif name.startswith('clip_projector') and not args.open_clip_projector:
+    #         print(f"Freeze {name}")
+    #         p.requires_grad = False
+    #     else:
+    #         print(f"Unfreeze {name}")
+
+    # model_ema = None
+    # if args.model_ema:
+    #     model_ema = ModelEma(
+    #         model,
+    #         decay=args.model_ema_decay,
+    #         device='cpu' if args.model_ema_force_cpu else '',
+    #         resume=''
+    #     )
+    #     print("Using EMA with decay = %.8f" % args.model_ema_decay)
+
+    # model_without_ddp = model
+    # n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # print("Model = %s" % str(model_without_ddp))
+    # print('number of params:', n_parameters)
+
+    # num_layers = model_without_ddp.get_num_layers()
+    # if args.layer_decay < 1.0:
+    #     assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
+    # else:
+    #     assigner = None
+
+    # if assigner is not None:
+    #     print("Assigned values = %s" % str(assigner.values))
+
+    # skip_weight_decay_list = model.no_weight_decay()
+    # print("Skip weight decay list: ", skip_weight_decay_list)
+
+    # ceph_args = {
+    #     'use_ceph_checkpoint': args.use_ceph_checkpoint,
+    #     'ceph_checkpoint_prefix': args.ceph_checkpoint_prefix,
+    #     'ckpt_path_split': args.ckpt_path_split,
+    #     'local_rank': args.gpu,
+    # }
+    # if ceph_args['use_ceph_checkpoint']:
+    #     print("Will automatically upload model on ceph")
+    #     assert ceph_args['ceph_checkpoint_prefix'] != '', "Should set prefix for ceph checkpoint!"
+
+    # print("start epoch before auto load model ", args.start_epoch)
+    # utils.auto_load_model(
+    #     args=args, model=model, model_without_ddp=model_without_ddp,
+    #     optimizer=None, loss_scaler=None, model_ema=model_ema,
+    #     ceph_args=ceph_args,
+    # )
+
+    if args.nb_classes == 7:
+        ACTIVITY_THRESHOLDS = {
+            0: 0.5,
+            1: 0.5,
+            2: 0.3,
+            3: 0.5,
+            4: 1.0,
+            5: 0.5
+        }
     else:
-        model = create_model(
-            args.model,
-            pretrained=False,
-            num_classes=args.nb_classes,
-            num_frames=args.num_frames * args.num_segments,
-            tubelet_size=args.tubelet_size,
-            sep_pos_embed=args.sep_pos_embed,
-            fc_drop_rate=args.fc_drop_rate,
-            drop_path_rate=args.drop_path,
-            head_drop_path_rate=args.head_drop_path,
-            use_checkpoint=args.use_checkpoint,
-            checkpoint_num=args.checkpoint_num,
-            init_scale=args.init_scale,
-            init_values=args.layer_scale_init_value,
-            layerscale_no_force_fp32=args.layer_scale_init_value,
-        )
+        ACTIVITY_THRESHOLDS = {
+            0: 1.0,
+            1: 1.0,
+            2: 0.7
+        }
+
+    model = create_model(
+        args.model,
+        pretrained=False,
+        num_classes=args.nb_classes,
+        num_frames=args.num_frames * args.num_segments,
+        tubelet_size=args.tubelet_size,
+        sep_pos_embed=args.sep_pos_embed,
+        fc_drop_rate=args.fc_drop_rate,
+        drop_path_rate=args.drop_path,
+        head_drop_path_rate=args.head_drop_path,
+        use_checkpoint=args.use_checkpoint,
+        checkpoint_num=args.checkpoint_num,
+        init_scale=args.init_scale,
+        init_values=args.layer_scale_init_value,
+        layerscale_no_force_fp32=args.layerscale_no_force_fp32,
+        in_chans=3
+    )
 
     patch_size = model.patch_embed.patch_size
     print("Patch size = %s" % str(patch_size))
-    args.window_size = (args.num_frames // args.tubelet_size,
-                        args.input_size // patch_size[0],
-                        args.input_size // patch_size[1])
+    args.window_size = (args.num_frames // args.tubelet_size, args.input_size // patch_size[0], args.input_size // patch_size[1])
     args.patch_size = patch_size
 
-    print("start epoch here is ", args.start_epoch)
-    print("finetune is ", args.finetune)
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.finetune, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.finetune, map_location='cpu')
+
         print("Load ckpt from %s" % args.finetune)
         checkpoint_model = None
         for model_key in args.model_key.split('|'):
@@ -326,12 +571,14 @@ def main(args, ds_init):
                     checkpoint_model['head.weight'] = checkpoint_model['head.weight'][:args.nb_classes]
                     checkpoint_model['head.bias'] = checkpoint_model['head.bias'][:args.nb_classes]
                 elif args.nb_classes in [600, 700]:
+                    # download from https://drive.google.com/drive/folders/17cJd2qopv-pEG8NSghPFjZo1UUZ6NLVm
                     map_path = f'./k710/label_mixto{args.nb_classes}.json'
                     print(f'Load label map from {map_path}')
                     with open(map_path) as f:
                         label_map = json.load(f)
                     checkpoint_model['head.weight'] = checkpoint_model['head.weight'][label_map]
                     checkpoint_model['head.bias'] = checkpoint_model['head.bias'][label_map]
+                    
         all_keys = list(checkpoint_model.keys())
         new_dict = OrderedDict()
         for key in all_keys:
@@ -342,39 +589,38 @@ def main(args, ds_init):
             else:
                 new_dict[key] = checkpoint_model[key]
         checkpoint_model = new_dict
-        
-        print("finetune extra is ", args.finetune_extra)
-        if args.finetune_extra:
-            extra_checkpoint = torch.load(args.finetune_extra, map_location='cpu')
-            print("Load extra ckpt from %s" % args.finetune_extra)
-            extra_checkpoint_model = None
-            for model_key in args.model_key.split('|'):
-                if model_key in extra_checkpoint:
-                    extra_checkpoint_model = extra_checkpoint[model_key]
-                    print("Load state_dict by model_key = %s" % model_key)
-                    break
-            for k, v in extra_checkpoint_model.items():
-                new_k = k
-                if k.startswith('vision_encoder.'):
-                    new_k = k.replace('vision_encoder.', '')
-                else:
-                    print(f"Ignore keys: {k}")
-                    continue
-                checkpoint_model[new_k] = v
 
+        if checkpoint_model['patch_embed.proj.weight'].shape[2] == 1 and model.patch_embed.tubelet_size > 1:
+            print("Inflate patch embedding")
+            print(f"Use center initilization: {args.center_init}")
+            checkpoint_model['patch_embed.proj.weight'] = inflate_weight(
+                checkpoint_model['patch_embed.proj.weight'][:, :, 0], 
+                model.patch_embed.tubelet_size,
+                center=args.center_init
+            )
+
+        # interpolate position embedding
         if 'pos_embed' in checkpoint_model:
             pos_embed_checkpoint = checkpoint_model['pos_embed']
-            embedding_size = pos_embed_checkpoint.shape[-1]
-            num_patches = model.patch_embed.num_patches
-            num_extra_tokens = model.pos_embed.shape[-2] - num_patches
-            orig_t_size = args.orig_t_size
+            embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
+            num_patches = model.patch_embed.num_patches # 
+            num_extra_tokens = model.pos_embed.shape[-2] - num_patches # 0/1
+
+            # we use 8 frames for pretraining
+            orig_t_size = 8
             new_t_size = args.num_frames * args.num_segments // model.patch_embed.tubelet_size
-            orig_size = int(((pos_embed_checkpoint.shape[-2] - num_extra_tokens) // orig_t_size) ** 0.5)
-            new_size = int((num_patches // new_t_size) ** 0.5)
+            # height (== width) for the checkpoint position embedding
+            orig_size = int(((pos_embed_checkpoint.shape[-2] - num_extra_tokens)//(orig_t_size)) ** 0.5)
+            # height (== width) for the new position embedding
+            new_size = int((num_patches // (new_t_size))** 0.5)
+            
+            # class_token and dist_token are kept unchanged
             if orig_t_size != new_t_size:
                 print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
                 extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+                # only the position tokens are interpolated
                 pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+                # B, L, C -> B， T, HW, C -> BHW, C, T  (B = 1)
                 pos_tokens = pos_tokens.view(1, orig_t_size, -1, embedding_size)
                 pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, embedding_size, orig_t_size)
                 pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=new_t_size, mode='linear')
@@ -383,26 +629,39 @@ def main(args, ds_init):
                 new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
                 checkpoint_model['pos_embed'] = new_pos_embed
                 pos_embed_checkpoint = new_pos_embed
+
+            # class_token and dist_token are kept unchanged
             if orig_size != new_size:
                 print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
                 extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+                # only the position tokens are interpolated
                 pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+                # B, L, C -> BT, H, W, C -> BT, C, H, W
                 pos_tokens = pos_tokens.reshape(-1, new_t_size, orig_size, orig_size, embedding_size)
                 pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-                pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size)
-                pos_tokens = pos_tokens.flatten(1, 3)
+                pos_tokens = torch.nn.functional.interpolate(
+                    pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+                # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
+                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size) 
+                pos_tokens = pos_tokens.flatten(1, 3) # B, L, C
                 new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
                 checkpoint_model['pos_embed'] = new_pos_embed
+        
         elif 'pos_embed_spatial' in checkpoint_model and 'pos_embed_temporal' in checkpoint_model:
             pos_embed_spatial_checkpoint = checkpoint_model['pos_embed_spatial']
             pos_embed_temporal_checkpoint = checkpoint_model['pos_embed_temporal']
-            embedding_size = pos_embed_spatial_checkpoint.shape[-1]
-            num_patches = model.patch_embed.num_patches
+
+            embedding_size = pos_embed_spatial_checkpoint.shape[-1] # channel dim
+            num_patches = model.patch_embed.num_patches # 
+
             orig_t_size = pos_embed_temporal_checkpoint.shape[-2]
             new_t_size = args.num_frames // model.patch_embed.tubelet_size
+
+            # height (== width) for the checkpoint position embedding
             orig_size = int(pos_embed_spatial_checkpoint.shape[-2] ** 0.5)
+            # height (== width) for the new position embedding
             new_size = int((num_patches // new_t_size) ** 0.5)
+
             if orig_t_size != new_t_size:
                 print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
                 tmp_pos_embed = pos_embed_temporal_checkpoint.view(1, orig_t_size, -1, embedding_size)
@@ -411,46 +670,23 @@ def main(args, ds_init):
                 tmp_pos_embed = tmp_pos_embed.view(1, -1, embedding_size, new_t_size)
                 tmp_pos_embed = tmp_pos_embed.permute(0, 3, 1, 2).reshape(1, -1, embedding_size)
                 checkpoint_model['pos_embed_temporal'] = tmp_pos_embed
+
             if orig_size != new_size:
                 print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
                 pos_tokens = pos_embed_spatial_checkpoint
+                # B, L, C -> BT, H, W, C -> BT, C, H, W
                 pos_tokens = pos_tokens.reshape(-1, new_t_size, orig_size, orig_size, embedding_size)
                 pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-                pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size)
-                pos_tokens = pos_tokens.flatten(1, 3)
+                pos_tokens = torch.nn.functional.interpolate(
+                    pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+                # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
+                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, new_t_size, new_size, new_size, embedding_size) 
+                pos_tokens = pos_tokens.flatten(1, 3) # B, L, C
                 checkpoint_model['pos_embed_spatial'] = pos_tokens
 
         utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
 
     model.to(device)
-
-    print("Freeze backbone for linear probing")
-    if '6B' in args.model:
-        depth = 48
-    else:
-        depth = 40  # ViT-g
-    block_num_list = [(depth - i - 1) for i in range(args.open_block_num)]
-    for name, p in model.named_parameters():
-        if name.startswith('patch_embed') or name.startswith('pos_embed') or name.startswith('cls_token'):
-            print(f"Freeze {name}")
-            p.requires_grad = False
-        elif name.startswith('blocks'):
-            flag = True
-            for num in block_num_list:
-                if name.startswith(f'blocks.{num}'):
-                    flag = False
-                    break
-            if flag:
-                print(f"Freeze {name}")
-                p.requires_grad = False
-            else:
-                print(f"Unfreeze {name}")
-        elif name.startswith('clip_projector') and not args.open_clip_projector:
-            print(f"Freeze {name}")
-            p.requires_grad = False
-        else:
-            print(f"Unfreeze {name}")
 
     model_ema = None
     if args.model_ema:
@@ -458,26 +694,14 @@ def main(args, ds_init):
             model,
             decay=args.model_ema_decay,
             device='cpu' if args.model_ema_force_cpu else '',
-            resume=''
-        )
+            resume='')
         print("Using EMA with decay = %.8f" % args.model_ema_decay)
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     print("Model = %s" % str(model_without_ddp))
     print('number of params:', n_parameters)
-
-    num_layers = model_without_ddp.get_num_layers()
-    if args.layer_decay < 1.0:
-        assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
-    else:
-        assigner = None
-
-    if assigner is not None:
-        print("Assigned values = %s" % str(assigner.values))
-
-    skip_weight_decay_list = model.no_weight_decay()
-    print("Skip weight decay list: ", skip_weight_decay_list)
 
     ceph_args = {
         'use_ceph_checkpoint': args.use_ceph_checkpoint,
@@ -489,7 +713,6 @@ def main(args, ds_init):
         print("Will automatically upload model on ceph")
         assert ceph_args['ceph_checkpoint_prefix'] != '', "Should set prefix for ceph checkpoint!"
 
-    print("start epoch before auto load model ", args.start_epoch)
     utils.auto_load_model(
         args=args, model=model, model_without_ddp=model_without_ddp,
         optimizer=None, loss_scaler=None, model_ema=model_ema,
@@ -497,45 +720,87 @@ def main(args, ds_init):
     )
     print("start epoch after auto load model ", args.start_epoch)
 
-
+    data_resize = Compose([
+        UniformResize(size=(args.input_size), interpolation='bilinear')
+    ])
+    data_transform = Compose([
+        ClipToTensor(),
+        Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
+    ])
 
     # Load the sample video
     sample = args.sample_path
-    buffer = loadvideo_decord(sample, args.num_frames, args.input_size)
-    # Instead of passing the numpy array directly, convert each frame to PIL, apply resize then transform.
-    transformed_frames = []
+    fname = os.path.join(args.prefix, sample)
+    if os.path.isdir(fname):
+        mp4_files = glob.glob(os.path.join(fname, "*.mp4"))
+    else:
+        mp4_files = [fname]
+    results = []
+    all_probs = []
+    with torch.no_grad():
+        results.append(['Filename', 'Probs'])
+        for fname in mp4_files:
+            if "darden" not in fname:
+                continue
+            try:
+                # fps, frame_count = get_video_info(fname)
+                # if frame_count < 100:
+                #     num_segments = 1
+                # else:
+                #     num_frames_3_point_2_seconds = int(fps * 3.2)
+                #     num_segments = int(frame_count / num_frames_3_point_2_seconds)
+                num_segments = 1
+            except IOError as e:
+                print("Skipping video ", fname)
+            for segment_idx in range(num_segments):
+                buffer = loadvideo_decord(fname, segment_idx=segment_idx, num_segment=args.num_frames)
+                print("buffer shape after loading video: ", buffer.shape)
+                # buffer_1 = buffer[:, :, :buffer.shape[1], :]
+                # buffer_2 = buffer[:, :, buffer.shape[1]:, :]
+                # for i, buffer in enumerate([buffer_1, buffer_2]):
+                # REDUCE BUFFER WIDTH TO MATCH HEIGHT
+                if buffer.shape[2] > buffer.shape[1]:
+                    width_minus_height = buffer.shape[2] - buffer.shape[1]
+                    buffer = buffer[:, :, width_minus_height // 2:buffer.shape[1] + width_minus_height // 2, :]
+                elif buffer.shape[1] > buffer.shape[2]:
+                    height_minus_width = buffer.shape[1] - buffer.shape[2]
+                    buffer = buffer[:, height_minus_width // 2:buffer.shape[2] + height_minus_width // 2, :, :]
+                buffer = data_resize(buffer)
+                if isinstance(buffer, list):
+                    buffer = np.stack(buffer, 0)
 
-    data_resize = Compose([
-        Resize((args.input_size, args.input_size), interpolation=InterpolationMode.BILINEAR)
-    ])
-    data_transform = Compose([
-        ToTensor(),
-    ])
-    for i in range(buffer.shape[0]):
-        pil_img = Image.fromarray(buffer[i])
-        resized_img = data_resize(pil_img)  # Apply Resize transform.
-        transformed_img = data_transform(resized_img)  # Apply ToTensor transform.
-        transformed_frames.append(transformed_img)
-    
+                    # save input image
+                    rows, cols = 2, args.num_frames // 2
+                    h, w = 224, 224
+                    grid = Image.new('RGB', (cols * w, rows * h))
 
-    # Convert frames to numpy format for visualization
-    frames_np = [frame.squeeze().permute(1, 2, 0).cpu().numpy() for frame in transformed_frames]  # Convert [C, H, W] -> [H, W, C]
-    frames_np = [(frame * 255).astype(np.uint8) for frame in frames_np]  # Ensure values are in range [0, 255]
-
-    # Save as GIF
-    # gif_path = args.sample_path[:-4] + ".gif"
-    # imageio.mimsave(gif_path, frames_np, fps=10)  # Adjust fps as needed
-
-    frames = torch.stack(transformed_frames, dim=0)  # [T, C, H, W]
-    frames = frames.permute(1, 0, 2, 3)  # [C, T, H, W]
-    videos = frames.unsqueeze(0)
-    videos = videos.to(device, non_blocking=True)
-
-    outputs = model(videos)
-    print("outputs ", outputs)
-    softmax_outputs = torch.softmax(outputs, dim=-1)
-    print("softmax outputs ", softmax_outputs)
-
+                    for j in range(args.num_frames):
+                        img = Image.fromarray(buffer[j])
+                        grid.paste(img, ((j % cols) * w, (j // cols) * h))
+                    save_path = f"combined_cropped_new_image_grid_buffer.png"
+                    grid.save(save_path)
+                    transformed_buffer = data_transform(buffer)
+                    videos = transformed_buffer.to(device, non_blocking=True).unsqueeze(0)
+                with torch.amp.autocast(device_type='cuda'):
+                    output = model(videos)
+                    probs = torch.softmax(output, dim=-1).cpu().detach().numpy()[0]
+                    print("output for fname ", fname, " segment idx ", segment_idx, " ", probs)
+                    results.append([fname, probs])
+                    for i, prob in enumerate(probs):
+                        if i != len(probs) - 1:
+                            if prob > ACTIVITY_THRESHOLDS[i]:
+                                print(f"ACTIVITY {i} detected with probability {prob:.4f} for video {fname} segment {segment_idx}")
+                                break
+                    
+                    all_probs.append(probs)
+    average = np.mean(all_probs, axis=0)
+    results.append(['Average', average])
+    print("Average probabilities: ", average)
+    with open(f"{sample}_results.csv", mode='w', newline='') as output_file:
+        print(f"saving results to {sample}_results.csv")
+        writer = csv.writer(output_file)
+        writer.writerows(results)
 
 if __name__ == '__main__':
     opts, ds_init = get_args()

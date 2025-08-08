@@ -14,10 +14,11 @@ from timm.utils import accuracy, ModelEma
 import utils
 from scipy.special import softmax
 from PIL import Image
-
+import seaborn as sns
+import re
 
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, average_precision_score, precision_recall_curve
+from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix, average_precision_score, precision_recall_curve, precision_score, recall_score
 
 ############################################################################
 # Helper function for safe barrier (for distributed mode)
@@ -57,7 +58,8 @@ def train_one_epoch(
     num_training_steps_per_epoch=None,
     update_freq=None,
     bf16=False,
-    internal_loss_scale=1.0
+    internal_loss_scale=1.0,
+    multilabel=False
 ):
     model.train(True)
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -104,13 +106,15 @@ def train_one_epoch(
         # Scale internal data by loss_scale
         loss_scales = []
         for path in paths:
-            if "comb_extracted_tracks" in path:
+            if "comb_extracted_tracks" in path or "internal_negative_videos" in path or "internal_positive_videos" in path:
                 loss_scales.append(internal_loss_scale)
             else:
                 loss_scales.append(1.0)
         loss_scales = torch.tensor(loss_scales).to(device, non_blocking=True)
-        loss = (losses * loss_scales).mean()
-
+        if multilabel:
+            loss = (losses * loss_scales[:, None]).mean()
+        else:
+            loss = (losses * loss_scales).mean()
         loss_value = loss.item()
         if not math.isfinite(loss_value):
             print(f"Loss is {loss_value}, stopping training")
@@ -201,13 +205,21 @@ def validation_one_epoch(data_loader, model, device, ds=False, bf16=False, outpu
     all_top5_scores = []
     all_probs = []  # For precision/recall and AP calculation
 
+    # category_names = {
+    #     0: "active break-in",
+    #     1: "assault",
+    #     2: "climbing over fence/gate/wall",
+    #     3: "actively taking objects",
+    #     4: "running or showing urgency",
+    #     5: "fall_floor",
+    #     6: "negative"
+    # }
+
     category_names = {
-        0: "active break-in",
-        1: "assault",
-        2: "climbing over fence/gate/wall",
-        3: "actively taking objects",
-        4: "running or showing urgency",
-        5: "fall_floor"
+        0: "climbing over fence/gate/wall",
+        1: "actively taking objects",
+        2: "fall_floor",
+        3: "negative"
     }
 
     for batch in metric_logger.log_every(data_loader, 10, header):
@@ -312,7 +324,7 @@ def validation_one_epoch(data_loader, model, device, ds=False, bf16=False, outpu
 # FINAL TEST FUNCTIONS
 ############################################################################
 @torch.no_grad()
-def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=False, multilabel=False, output_dir=None):
+def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=False, multilabel=False, output_dir=None, internal=False):
     """
     Final evaluation after all epochs.
     Overall accuracy (top-1 and top-5) is computed ignoring negative samples (target == -1),
@@ -332,15 +344,26 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
     all_probs = []
 
     # Category mapping for 6 classes
-    category_names = {
-        0: "active break-in",
-        1: "assault",
-        2: "climbing over fence/gate/wall",
-        3: "actively taking objects",
-        4: "running or showing urgency",
-        5: "fall_floor",
-        6: "vandalism"
-    }
+    if num_classes == 7:
+        category_names = {
+            0: "active break-in",
+            1: "assault",
+            2: "climbing over fence/gate/wall",
+            3: "actively taking objects",
+            4: "running or showing urgency",
+            5: "fall_floor",
+            6: "negative"
+        }
+    else:
+        category_names = {
+            0: "climbing",
+            1: "actively taking objects",
+            2: "fall_floor",
+            3: "negative"
+        }
+
+    if multilabel:
+        del category_names[-1]
 
     final_result = []
     for batch in metric_logger.log_every(data_loader, 10, header):
@@ -349,7 +372,6 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         segment_indices = batch[4]
 
         videos = videos.to(device, non_blocking=True)
-        print("videos shape ",videos.shape)
         target = target.to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type='cuda'):
@@ -371,9 +393,14 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         # Save per-sample predictions (JSON-serialized) for merging
         for i in range(output.size(0)):
             prob_json = json.dumps(probs.data[i].float().cpu().numpy().tolist())
-            line = f"{video_ids[i]} {segment_indices[i]} {prob_json} {int(target[i].cpu().numpy())}\n"
-            final_result.append(line)
-            # # save input image
+            if multilabel:
+                for j in range(target[i].cpu().numpy().shape[0]):
+                    line = f"{video_ids[i]} {segment_indices[i]} {prob_json} {int(target[i][j].cpu().numpy())}\n"
+                    final_result.append(line)
+            else:
+                line = f"{video_ids[i]} {segment_indices[i]} {prob_json} {int(target[i].cpu().numpy())}\n"
+                final_result.append(line)
+            # save input image
             # rows, cols = 2, 4
             # h, w = 224, 224
             # grid = Image.new('RGB', (cols * w, rows * h))
@@ -387,51 +414,40 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
             # os.makedirs(parent_dir, exist_ok=True)
             # grid.save(save_path)
 
-        # if valid_mask.sum() > 0:
-        #     valid_outputs = output[valid_mask]
-        #     valid_targets = target[valid_mask]
-        #     acc1, acc5 = accuracy(valid_outputs, valid_targets, topk=(1, 5))
-        #     batch_valid_count = valid_mask.sum().item()
-        #     metric_logger.meters['acc1'].update(acc1.item(), n=batch_valid_count)
-        #     metric_logger.meters['acc5'].update(acc5.item(), n=batch_valid_count)
-        # metric_logger.update(loss=loss.item())
 
     with open(file, "w") as f:
         f.write("video_id segment_idx probabilities true_label\n")
         for line in final_result:
             f.write(line)
 
-    # metric_logger.synchronize_between_processes()
-    # print("* Test Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}"
-    #       .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
-    
     # Combine probabilities from all batches
     all_probs = torch.cat(all_probs, dim=0)  # shape [N, C]
 
 
-    # Average results by chunk_id and split_id that correspond to same video
+    # Average results by segment_idx that correspond to same video
     # Dictionary to store sums of probabilities and counts for averaging
     prob_sums = defaultdict(lambda: torch.zeros(all_probs.shape[1]))  # Shape [C]
     prob_maxes = defaultdict(lambda: torch.zeros(all_probs.shape[1]))  # Shape [C]
     counts = defaultdict(int)
     targets_map = {}
 
-    # Aggregate probabilities by video_id
+    # TODO: Aggregate probabilities by videos from same track with different segments
     for video_id, probs, target in zip(all_video_ids, all_probs, all_targets):
+        # shortened_video_id = re.sub(r'_segment_\d+', '', video_id)
+        shortened_video_id = video_id
         if multilabel:
-            targets_map[video_id] = target
+            targets_map[shortened_video_id] = target
         else:
-            if video_id not in targets_map:
-                targets_map[video_id] = np.zeros(num_classes, dtype=np.float32)
+            if shortened_video_id not in targets_map:
+                targets_map[shortened_video_id] = np.zeros(num_classes, dtype=np.float32)
             if target != -1:
-                targets_map[video_id][target] = 1.0
-        # TODO: try max prob for video segments rather than averaging
-        prob_sums[video_id] += probs
+                targets_map[shortened_video_id][target] = 1.0
+        prob_sums[shortened_video_id] += probs
         if video_id in prob_maxes:
-            prob_maxes[video_id] = torch.max(prob_maxes[video_id], probs)
+            prob_maxes[shortened_video_id] = torch.max(prob_maxes[shortened_video_id], probs)
         else:
-            prob_maxes[video_id] = probs 
-        counts[video_id] += 1
+            prob_maxes[shortened_video_id] = probs 
+        counts[shortened_video_id] += 1
 
     print("all_probs original shape ", all_probs.shape)
     print("all targets original len ", len(all_targets))
@@ -446,7 +462,7 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
     ############################################################################
     # Compute per-class Average Precision (AP) using all samples (including negatives)
     ############################################################################
-    def compute_average_precision(all_probs, all_targets, category_names, multilabel):
+    def compute_average_precision(all_probs, all_targets):
         # Convert tensor of probabilities to NumPy array
         all_probs_np = all_probs.cpu().numpy()
         all_targets_np = np.array(all_targets)
@@ -454,70 +470,113 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         print("all targets np shape ", all_targets_np.shape)
         C = all_probs_np.shape[1]
         average_ap = 0
-        # if multilabel:
         ap_per_class = average_precision_score(all_targets_np, all_probs_np, average=None)
-        print("ap per class shape ", ap_per_class.shape)
         average_ap = np.mean(ap_per_class)
         class_aps = {c: ap_per_class[c] for c in range(C)}
         print(f"AP for all classes: {class_aps}")
-        # else:
-        #     class_aps = {}
-        #     print("Per-class Average Precision (AP):")
-        #     for c in range(C):
-        #         is_pos = (all_targets_np == c).astype(int)
-        #         if np.sum(is_pos) == 0:
-        #             ap = 0.0
-        #             precision, recall = [1, 0], [0, 1]  # Default PR curve for empty class
-        #         else:
-        #             scores = all_probs_np[:, c]
-        #             if c == 6:
-        #                 print("scores is ", scores)
-        #             ap = average_precision_score(is_pos, scores)
-        #             print("Output dir is ", output_dir)
-        #             if output_dir:
-        #                 precision, recall, _ = precision_recall_curve(is_pos, scores)
-        #                 # Plot Precision-Recall curve
-        #                 plt.figure(figsize=(6, 5))
-        #                 plt.plot(recall, precision, marker='.', label=f'Class {c}: {category_names.get(c, f"Cat {c}")}')
-        #                 plt.xlabel('Recall')
-        #                 plt.ylabel('Precision')
-        #                 plt.title(f'Precision-Recall Curve for Class {c}')
-        #                 plt.legend()
-        #                 plt.grid()
-        #                 save_path = os.path.join(output_dir, f'pr_curve_class_{c}.png')
-        #                 plt.savefig(save_path, dpi=300)
-        #                 print("saved figure to ", save_path)
-        #                 plt.close()  # Close the figure to free memory
-        #         average_ap += ap
-        #         class_aps[c] = ap
-        #         print(f"  AP for class {c} ({category_names.get(c, f'Cat {c}')}) : {ap:.4f}")
-        #     average_ap /= C
         print("End of per-class AP.\n")
-        return average_ap, class_aps
-    
-    average_ap, class_aps = compute_average_precision(new_all_probs, new_all_targets, category_names, multilabel)
 
-    ############################################################################
-    # Save confusion matrix using only valid (non -1) samples
-    ############################################################################
-    # valid_idx = [i for i, lbl in enumerate(all_targets) if lbl != -1]
-    # valid_preds = [all_top1[i] for i in valid_idx]
-    # valid_labels = [all_targets[i] for i in valid_idx]
-    # cm = confusion_matrix(valid_labels, valid_preds)
-    # plt.figure(figsize=(10, 8))
-    # plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    # plt.title("Confusion Matrix - Final Test")
-    # plt.colorbar()
-    # tick_marks = np.arange(len(category_names))
-    # plt.xticks(tick_marks, [category_names[i] for i in tick_marks], rotation=45, ha="right")
-    # plt.yticks(tick_marks, [category_names[i] for i in tick_marks])
-    # plt.ylabel("True Label")
-    # plt.xlabel("Predicted Label")
-    # plt.tight_layout()
-    # cm_path = os.path.join(os.path.dirname(file), "test_confusion_matrix.png")
-    # plt.savefig(cm_path)
-    # print(f"[DEBUG] Saved final test confusion matrix to {cm_path}")
-    # plt.close()
+        return average_ap, class_aps
+
+        
+    average_ap, class_aps = compute_average_precision(new_all_probs, new_all_targets)
+    probs = new_all_probs.cpu().numpy()
+    
+    target_counts = np.zeros(num_classes, dtype=int)
+    target_probs = np.zeros((num_classes, num_classes), dtype=float)
+
+    # Loop through each sample
+    targets_np = np.array(new_all_targets)
+    for i in range(targets_np.shape[0]):
+        true_indices = np.where(targets_np[i])[0]
+        
+        for t in true_indices:
+            target_counts[t] += 1
+            target_probs[t] += probs[i]
+    
+    for t in range(target_counts.shape[0]):
+        if (target_counts[t]):
+            target_probs[t] /= target_counts[t]
+    
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(target_probs, annot=True, xticklabels=category_names, yticklabels=category_names, cmap="Blues")
+    plt.xlabel("Predicted Class")
+    plt.ylabel("True Class")
+    plt.title("Multilabel Class Confusion Matrix")
+    plt.tight_layout()
+    if internal:
+        plt.savefig(f"{output_dir}/internal_multilabel_confusion_heatmap.png")
+    else:
+        plt.savefig(f"{output_dir}/multilabel_confusion_heatmap.png")
+    plt.close()
+
+    # --- Plotting Precision-Recall Curves ---
+    all_probs_np = probs
+    all_targets_np = targets_np
+    C = all_targets_np.shape[1]
+    plt.figure(figsize=(15, 10))
+    for i in range(C):
+        precision, recall, thresholds = precision_recall_curve(all_targets_np[:, i], all_probs_np[:, i])
+
+        # Plotting the precision-recall curve
+        plt.subplot(int(np.ceil(C / 3)), 3, i + 1) # Adjust subplot layout as needed
+        plt.plot(recall, precision, label=f'Class {category_names[i]}')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title(f'Precision-Recall Curve for {category_names[i]}')
+        plt.grid(True)
+        plt.legend()
+
+        # Optional: Add thresholds to the plot
+        # This can make the plot busy, so consider plotting a subset of thresholds or using annotations.
+        # For demonstration, let's plot a few thresholds
+        # Choose a strategy to select thresholds, e.g., evenly spaced or at certain recall/precision points.
+        # Here, we'll just plot every 3rd threshold for brevity.
+        for j in range(0, len(thresholds), 10):
+            plt.text(recall[j], precision[j], f'{thresholds[j]:.2f}', fontsize=8)
+
+
+    plt.tight_layout()
+    if internal:
+        plt.savefig(f"{output_dir}/internal_precision_recall_curves.png")
+    else:
+        plt.savefig(f"{output_dir}/precision_recall_curves.png")
+
+     # --- Calculate and Print Precision and Recall for a Specific Threshold ---
+    print("\n--- Precision and Recall at a Specific Threshold ---")
+    if num_classes == 7:
+        ACTIVITY_THRESHOLDS = {
+            0: 0.5,
+            1: 0.5,
+            2: 0.3,
+            3: 0.5,
+            4: 1.0,
+            5: 0.5
+        }
+    else:
+        ACTIVITY_THRESHOLDS = {
+            0: 0.7,
+            1: 0.7,
+            2: 0.7
+        }
+
+    for i in range(C - 1):
+        # Convert probabilities to binary predictions based on the threshold
+        binary_predictions = (all_probs_np[:, i] >= ACTIVITY_THRESHOLDS[i]).astype(int)
+
+        # Calculate precision and recall for the current class
+        # Handle cases where there are no true positives or predicted positives to avoid warnings/errors
+        try:
+            class_precision = precision_score(all_targets_np[:, i], binary_predictions, zero_division=0)
+        except ValueError: # Catches cases where there are no positive samples in true or pred
+            class_precision = 0.0 # Or np.nan, depending on desired behavior
+
+        try:
+            class_recall = recall_score(all_targets_np[:, i], binary_predictions, zero_division=0)
+        except ValueError:
+            class_recall = 0.0
+
+        print(f"Class '{category_names[i]}': Precision = {class_precision:.4f}, Recall = {class_recall:.4f}")
 
     safe_barrier()
     # return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

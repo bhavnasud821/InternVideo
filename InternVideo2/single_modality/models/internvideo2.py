@@ -636,10 +636,12 @@ if __name__ == '__main__':
 
     # Example: Uncomment the model you wish to profile.
     # model = internvideo2_1B_patch14_224(num_classes=400).cuda().half()
-    model = internvideo2_6B_patch14_224(num_classes=400).cuda().half()
+    # model = internvideo2_6B_patch14_224(num_classes=400).cuda().half()
+    model = internvideo2_small_patch14_224(num_classes=7).cuda()
     print(model)
 
-    flops = FlopCountAnalysis(model, torch.rand(1, 3, num_frames, img_size, img_size).cuda().half())
+    # flops = FlopCountAnalysis(model, torch.rand(1, 3, num_frames, img_size, img_size).cuda().half())
+    flops = FlopCountAnalysis(model, torch.rand(1, 3, num_frames, img_size, img_size).cuda())
     s = time.time()
     print(flop_count_table(flops, max_depth=1))
     print(time.time()-s)

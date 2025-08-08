@@ -13,6 +13,7 @@ from collections import OrderedDict
 from datasets.mixup import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from torch.nn import BCEWithLogitsLoss
 from timm.utils import ModelEma
 from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
 
@@ -24,6 +25,8 @@ import utils
 from models import *
 from models.internvl_clip_vision import inflate_weight
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['RDMAV_FORK_SAFE'] = '1'
 
 def get_args():
     parser = argparse.ArgumentParser('VideoMAE fine-tuning and evaluation script for video classification', add_help=False)
@@ -39,6 +42,27 @@ def get_args():
                         help='prefix for checkpoint in ceph')
     parser.add_argument('--ckpt_path_split', default='/exp/', type=str,
                         help='string for splitting the ckpt_path')
+    parser.add_argument('--multilabel', action='store_true', help="whether to use multilabel sigmoid loss training")
+    parser.add_argument('--grayscale', action='store_true', help='whether to train with grayscale videos')
+    parser.add_argument('--include_negative_category', action='store_true', help='whether to include a negative category for single label model training')
+    parser.add_argument('--internal_loss_scale', type=float, default=1.0, help='How much to scale internal data during training')
+    parser.add_argument('--save_training_images', action='store_true')
+    parser.add_argument('--test_combined_cropped', action='store_true', help='Whether to test on the data that was cropped to people in view')
+    parser.add_argument('--train_combined_cropped', action='store_true', help='Whether to train on the data that was cropped to people in view')
+    parser.add_argument('--enable_class_weights', action='store_true', help='Whether to weight loss by amount of data from the class')
+    parser.add_argument('--test_anno_path', type=str, default=None)
+    parser.add_argument('--train_anno_path', type=str, default=None)
+    parser.add_argument('--min_padding_ratio_positive', type=float, default=0.1, help='min amount to expand bbox around people during training (positive)')
+    parser.add_argument('--max_padding_ratio_positive', type=float, default=0.5, help='max amount to expand bbox around people during training (positive)')
+    parser.add_argument('--min_padding_ratio_negative', type=float, default=0.1, help='min amount to expand bbox around people during training (negative)')
+    parser.add_argument('--max_padding_ratio_negative', type=float, default=0.5, help='max amount to expand bbox around people during training (negative)')
+    parser.add_argument('--test_padding_ratio', type=float, default=0.1, help='amount to expand bbox around people during testing')
+    parser.add_argument('--eval_yolo_crops', action='store_true', help='Whether to use yolo crops for evaluation, otherwise use the crops from labeled activity')
+    parser.add_argument('--train_yolo_crops', action='store_true', help='Whether to use yolo crops for training, otherwise use the crops from labeled activity')
+    parser.add_argument('--use_random_yolo_crop', action='store_true', help='Whether to randomly switch between yolo crops and labeled activity crops during training')
+    parser.add_argument('--spatial_augmentation_min_scale', type=float, default=0.08, help='Minimum scale for spatial augmentation')
+    parser.add_argument('--new_spatial_augmentation', action='store_true', help='Whether to apply new spatial augmentation to create random bbox that must include activity/people')
+    parser.add_argument('--second_half_falling', action='store_true', help='Whether to use second half of falling videos for training')
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL',
@@ -102,6 +126,7 @@ def get_args():
                         help='epochs to warmup LR, if scheduler supports')
     parser.add_argument('--warmup_steps', type=int, default=-1, metavar='N',
                         help='num of steps to warmup LR, will overload warmup_epochs if set > 0')
+    parser.add_argument("--gpu", type=int, default=0, help="GPU id to use for training (default: 0)")
 
     # Augmentation parameters
     parser.add_argument('--color_jitter', type=float, default=0.4, metavar='PCT',
@@ -132,18 +157,12 @@ def get_args():
                         help='Do not random erase first (clean) augmentation split')
 
     # Mixup params
-    parser.add_argument('--mixup', type=float, default=0.8,
-                        help='mixup alpha, mixup enabled if > 0.')
-    parser.add_argument('--cutmix', type=float, default=1.0,
-                        help='cutmix alpha, cutmix enabled if > 0.')
-    parser.add_argument('--cutmix_minmax', type=float, nargs='+', default=None,
-                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
-    parser.add_argument('--mixup_prob', type=float, default=1.0,
-                        help='Probability of performing mixup or cutmix when either/both is enabled')
-    parser.add_argument('--mixup_switch_prob', type=float, default=0.5,
-                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
-    parser.add_argument('--mixup_mode', type=str, default='batch',
-                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
+    parser.add_argument('--mixup', type=float, default=0, help='mixup alpha, mixup enabled if > 0.')
+    parser.add_argument('--cutmix', type=float, default=0, help='cutmix alpha, cutmix enabled if > 0.')
+    parser.add_argument('--cutmix_minmax', type=float, nargs='+', default=None, help='cutmix min/max ratio')
+    parser.add_argument('--mixup_prob', type=float, default=1.0, help='Probability of performing mixup or cutmix')
+    parser.add_argument('--mixup_switch_prob', type=float, default=0.5, help='Probability of switching to cutmix')
+    parser.add_argument('--mixup_mode', type=str, default='batch', help='How to apply mixup/cutmix params')
 
     # Finetuning params
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
@@ -227,6 +246,9 @@ def get_args():
     parser.add_argument('--zero_stage', default=0, type=int,
                         help='ZeRO optimizer stage (default: 0)')
 
+    # Testing group
+    parser.add_argument('--internal_test', action='store_true')
+
     known_args, _ = parser.parse_known_args()
 
     if known_args.enable_deepspeed:
@@ -252,7 +274,8 @@ def main(args, ds_init):
 
     print(args)
 
-    device = torch.device(args.device)
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    print("DEBUG: Using device: %s", device)
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -263,10 +286,11 @@ def main(args, ds_init):
     cudnn.benchmark = True
 
     dataset_train, args.nb_classes = build_dataset(is_train=True, test_mode=False, args=args)
-    if args.disable_eval_during_finetuning:
-        dataset_val = None
-    else:
-        dataset_val, _ = build_dataset(is_train=False, test_mode=False, args=args)
+
+    # if args.disable_eval_during_finetuning:
+    #     dataset_val = None
+    # else:
+    #     dataset_val, _ = build_dataset(is_train=False, test_mode=False, args=args)
     dataset_test, _ = build_dataset(is_train=False, test_mode=True, args=args)
     
 
@@ -276,17 +300,17 @@ def main(args, ds_init):
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
     )
     print("Sampler_train = %s" % str(sampler_train))
-    if args.dist_eval:
-        if len(dataset_val) % num_tasks != 0:
-            print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                    'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                    'equal num of samples per-process.')
-        sampler_val = torch.utils.data.DistributedSampler(
-            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-        sampler_test = torch.utils.data.DistributedSampler(
-            dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-    else:
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    # if args.dist_eval:
+    #     if len(dataset_val) % num_tasks != 0:
+    #         print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+    #                 'This will slightly alter validation results as extra duplicate entries are added to achieve '
+    #                 'equal num of samples per-process.')
+    #     sampler_val = torch.utils.data.DistributedSampler(
+    #         dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+    sampler_test = torch.utils.data.DistributedSampler(
+        dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+    # else:
+    #     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -295,7 +319,7 @@ def main(args, ds_init):
         log_writer = None
 
     if args.num_sample > 1:
-        collate_func = partial(multiple_samples_collate, fold=False)
+        collate_func = partial(utils.multiple_samples_collate, fold=False)
     else:
         collate_func = None
 
@@ -309,17 +333,17 @@ def main(args, ds_init):
         persistent_workers=True
     )
 
-    if dataset_val is not None:
-        data_loader_val = torch.utils.data.DataLoader(
-            dataset_val, sampler=sampler_val,
-            batch_size=int(1.5 * args.batch_size),
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            persistent_workers=True
-        )
-    else:
-        data_loader_val = None
+    # if dataset_val is not None:
+    #     data_loader_val = torch.utils.data.DataLoader(
+    #         dataset_val, sampler=sampler_val,
+    #         batch_size=int(1.5 * args.batch_size),
+    #         num_workers=args.num_workers,
+    #         pin_memory=args.pin_mem,
+    #         drop_last=False,
+    #         persistent_workers=True
+    #     )
+    # else:
+    #     data_loader_val = None
 
     if dataset_test is not None:
         data_loader_test = torch.utils.data.DataLoader(
@@ -357,6 +381,7 @@ def main(args, ds_init):
         init_scale=args.init_scale,
         init_values=args.layer_scale_init_value,
         layerscale_no_force_fp32=args.layerscale_no_force_fp32,
+        in_chans=1 if args.grayscale else 3
     )
 
     patch_size = model.patch_embed.patch_size
@@ -518,7 +543,7 @@ def main(args, ds_init):
         print("Using EMA with decay = %.8f" % args.model_ema_decay)
 
     model_without_ddp = model
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_parameters = sum(p.numel() for p in model.parameters())
 
     print("Model = %s" % str(model_without_ddp))
     print('number of params:', n_parameters)
@@ -581,13 +606,26 @@ def main(args, ds_init):
         args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
     print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
-    if mixup_fn is not None:
+    if args.multilabel:
+        criterion = BCEWithLogitsLoss(reduction='none')
+    elif mixup_fn is not None:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        criterion = torch.nn.CrossEntropyLoss()
+        class_counts = dataset_train.class_counts
+        print("class counts ", class_counts)
+        # Compute weights: inverse of frequency (add epsilon to avoid div by 0)
+        epsilon = 1e-6
+        class_weights = 1.0 / (class_counts + epsilon)
+        class_weights = class_weights / class_weights.sum()
+        class_weights = class_weights.to(device)
+        print("class weights ", class_weights)
+        if args.enable_class_weights:
+            criterion = torch.nn.CrossEntropyLoss(reduction='none', weight=class_weights)
+        else:
+            criterion = torch.nn.CrossEntropyLoss(reduction='none')
 
     print("criterion = %s" % str(criterion))
     ceph_args = {
@@ -609,24 +647,30 @@ def main(args, ds_init):
     print(f"Use bf16 {args.bf16}")
 
     if args.eval:
-        preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, output_dir=args.output_dir)
-        torch.distributed.barrier()
-        if global_rank == 0:
-            print("Start merging results...")
-            final_top1 ,final_top5 = merge(args.output_dir, num_tasks)
-            print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
-            log_stats = {'Final top-1': final_top1,
-                        'Final Top-5': final_top5}
-            if args.output_dir and utils.is_main_process():
-                with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-        exit(0)
+        preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
+        internal = "internal_test" in args.test_anno_path
+        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        # preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+        # test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, output_dir=args.output_dir)
+        # torch.distributed.barrier()
+        # if global_rank == 0:
+        #     print("Start merging results...")
+        #     final_top1 ,final_top5 = merge(args.output_dir, num_tasks)
+        #     print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
+        #     log_stats = {'Final top-1': final_top1,
+        #                 'Final Top-5': final_top5}
+        #     if args.output_dir and utils.is_main_process():
+        #         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+        #             f.write(json.dumps(log_stats) + "\n")
+        # exit(0)
         
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
+    print("start epoch is ", args.start_epoch)
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -638,7 +682,7 @@ def main(args, ds_init):
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            bf16=args.bf16
+            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale, multilabel=args.multilabel
         )
         if args.output_dir and args.save_ckpt:
             # if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
@@ -652,40 +696,35 @@ def main(args, ds_init):
                 loss_scaler=loss_scaler, epoch=epoch, model_name='latest', model_ema=model_ema,
                 ceph_args=ceph_args,
             )
-        if data_loader_val is not None:
-            test_stats = validation_one_epoch(data_loader_val, model, device, ds=args.enable_deepspeed, bf16=args.bf16)
+        if data_loader_test is not None:
+            preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
+            internal = "internal_test" in args.test_anno_path
+            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
+            print("Got average AP ", average_ap)
             timestep = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-            print(f"[{timestep}] Accuracy of the network on the {len(dataset_val)} val videos: {test_stats['acc1']:.1f}%")
-            if max_accuracy < test_stats["acc1"]:
-                max_accuracy = test_stats["acc1"]
+            if max_accuracy < average_ap:
+                max_accuracy = average_ap
                 if args.output_dir and args.save_ckpt:
                     utils.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch=epoch, model_name='best', model_ema=model_ema,
                         ceph_args=ceph_args,
                     )
-
-            print(f'Max accuracy: {max_accuracy:.2f}%')
-            if log_writer is not None:
-                log_writer.update(val_acc1=test_stats['acc1'], head="perf", step=epoch)
-                log_writer.update(val_acc5=test_stats['acc5'], head="perf", step=epoch)
-                log_writer.update(val_loss=test_stats['loss'], head="perf", step=epoch)
-
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         **{f'val_{k}': v for k, v in test_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
+            log_stats = {
+                "class_aps": class_aps,
+                "average_ap": average_ap
+            }
         else:
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch,
                          'n_parameters': n_parameters}
         if args.output_dir and utils.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
+            # if log_writer is not None:
+            #     log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+    preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
     if args.test_best:
         print("Auto testing the best model")
         args.eval = True
@@ -694,17 +733,21 @@ def main(args, ds_init):
             optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
             ceph_args=ceph_args,
         )
-    test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, output_dir=args.output_dir)
-    torch.distributed.barrier()
-    if global_rank == 0:
-        print("Start merging results...")
-        final_top1 ,final_top5 = merge(args.output_dir, num_tasks)
-        print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
-        log_stats = {'Final top-1': final_top1,
-                    'Final Top-5': final_top5}
-        if args.output_dir and utils.is_main_process():
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+    # test_stats = final_test(data_loader_test, model, device, preds_file, ds=args.enable_deepspeed, bf16=args.bf16, output_dir=args.output_dir)
+    # torch.distributed.barrier()
+    # if global_rank == 0:
+    #     print("Start merging results...")
+    #     final_top1 ,final_top5 = merge(args.output_dir, num_tasks)
+    #     print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
+    #     log_stats = {'Final top-1': final_top1,
+    #                 'Final Top-5': final_top5}
+    #     if args.output_dir and utils.is_main_process():
+    #         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+    #             f.write(json.dumps(log_stats) + "\n")
+    internal = "internal_test" in args.test_anno_path
+    average_ap = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

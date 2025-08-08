@@ -135,6 +135,7 @@ def random_crop(images, size, boxes=None):
         return images
     height = images.shape[2]
     width = images.shape[3]
+    print("height: ", height, "width: ", width, "size: ", size)
     y_offset = 0
     if height > size:
         y_offset = int(np.random.randint(0, height - size))
@@ -546,7 +547,7 @@ def random_resized_crop(
     images,
     target_height,
     target_width,
-    scale=(0.8, 1.0),
+    scale=(0.08, 1.0),
     ratio=(3.0 / 4.0, 4.0 / 3.0),
 ):
     """
@@ -563,7 +564,6 @@ def random_resized_crop(
         scale: Scale range of Inception-style area based random resizing.
         ratio: Aspect ratio range of Inception-style area based random resizing.
     """
-
     height = images.shape[2]
     width = images.shape[3]
 
@@ -596,9 +596,11 @@ def random_resized_crop_with_shift(
         scale: Scale range of Inception-style area based random resizing.
         ratio: Aspect ratio range of Inception-style area based random resizing.
     """
+    print("in random resized crop with shift")
     t = images.shape[1]
     height = images.shape[2]
     width = images.shape[3]
+    print("images shape before ", images.shape)
 
     i, j, h, w = _get_param_spatial_crop(scale, ratio, height, width)
     i_, j_, h_, w_ = _get_param_spatial_crop(scale, ratio, height, width)
@@ -606,6 +608,7 @@ def random_resized_crop_with_shift(
     j_s = [int(i) for i in torch.linspace(j, j_, steps=t).tolist()]
     h_s = [int(i) for i in torch.linspace(h, h_, steps=t).tolist()]
     w_s = [int(i) for i in torch.linspace(w, w_, steps=t).tolist()]
+    print("i_s: ", i_s, "j_s: ", j_s, "h_s: ", h_s, "w_s: ", w_s)
     out = torch.zeros((3, t, target_height, target_width))
     for ind in range(t):
         out[:, ind : ind + 1, :, :] = torch.nn.functional.interpolate(
@@ -626,6 +629,7 @@ def create_random_augment(
     input_size,
     auto_augment=None,
     interpolation="bilinear",
+    translate=True
 ):
     """
     Get video randaug transform.
@@ -648,7 +652,12 @@ def create_random_augment(
             img_size_min = min(img_size)
         else:
             img_size_min = img_size
-        aa_params = {"translate_const": int(img_size_min * 0.45)}
+        if translate:
+            aa_params = {"translate_const": int(img_size_min * 0.45)}
+            # print("still doing translate!")
+        else:
+            # print("skipping translate!")
+            aa_params = {"translate_const": 0}
         if interpolation and interpolation != "random":
             aa_params["interpolation"] = _pil_interp(interpolation)
         if auto_augment.startswith("rand"):

@@ -9,7 +9,7 @@ from .kinetics import VideoClsDataset
 from .kinetics_sparse import VideoClsDataset_sparse
 from .anet import ANetDataset
 from .ssv2 import SSVideoClsDataset, SSRawFrameClsDataset
-from .hmdb import HMDBVideoClsDataset, HMDBRawFrameClsDataset
+from .hmdb import HMDBVideoClsDataset
 # NEW: Import our custom video classification dataset (numeric labels)
 from .custom_video_cls_dataset_numeric import CustomVideoClsDatasetNumeric
 
@@ -142,17 +142,31 @@ def build_dataset(is_train, test_mode, args):
             path_prefix = "internal_"
         else:
             path_prefix = ""
+        if args.test_combined_cropped and test_mode:
+            path_postfix = "_combined_cropped"
+        else:
+            path_postfix = ""
+        if args.train_combined_cropped:
+            path_postfix = "_combined_cropped"
         if args.multilabel:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel_cleaned_2.csv")
+            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel_cleaned_4_filtered{path_postfix}.csv")
         else:
             if args.include_negative_category:
-                anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_with_negative_cleaned_2.csv")
+                if mode == 'train':
+                    anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_with_negative_cleaned_4_filtered_more_climbing_vids{path_postfix}.csv")
+                else:
+                    anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_with_negative_cleaned_4_filtered{path_postfix}.csv")
             else:
-                anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned_2.csv")
+                anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned_4_filtered{path_postfix}.csv")
+        # override anno paths if directly provided
+        if args.train_anno_path and mode == 'train':
+            anno_path = args.train_anno_path
+        elif args.test_anno_path and mode == 'test':
+            anno_path = args.test_anno_path
         if args.use_decord:
             func = HMDBVideoClsDataset
-        else:
-            func = HMDBRawFrameClsDataset
+        # else:
+        #     func = HMDBRawFrameClsDataset
         dataset = func(
             anno_path=anno_path,
             prefix=args.prefix,
@@ -171,7 +185,7 @@ def build_dataset(is_train, test_mode, args):
             filename_tmpl=args.filename_tmpl,
             args=args)
         # check is_train to avoid updating nb_classes twice
-        if args.include_negative_category and is_train:
+        if args.include_negative_category and is_train and not args.multilabel:
             args.nb_classes += 1
         nb_classes = 51 if not args.nb_classes else args.nb_classes
     elif args.data_set in ['ANet', 'HACS', 'ANet_interval', 'HACS_interval']:
@@ -199,50 +213,50 @@ def build_dataset(is_train, test_mode, args):
             new_width=320,
             args=args)
         nb_classes = args.nb_classes
-    elif args.data_set == 'MyCustom':
-        # mode = 'train' if is_train else ('test' if test_mode else 'validation')
-        # anno_path = os.path.join(args.data_path, f"{mode}.csv")
-        # dataset = CustomVideoClsDatasetNumeric(
-        #     anno_path=anno_path,
-        #     prefix=args.prefix,
-        #     split=args.split,
-        #     mode=mode,
-        #     clip_len=args.num_frames,
-        #     crop_size=args.input_size,
-        #     short_side_size=args.short_side_size,
-        #     new_height=256,
-        #     new_width=320,
-        #     filename_tmpl=args.filename_tmpl,
-        #     args=args
-        # )
-        # # nb_classes = len(set(dataset.label_array))
-        # nb_classes = 6
-        if is_train:
-            mode = 'train'
-        else:
-            mode = 'test'
-        if args.internal_test and test_mode:
-            path_prefix = "internal_"
-        else:
-            path_prefix = ""
-        if args.multilabel:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel_cleaned_2.csv")
-        else:
-            anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned_2.csv")
-        dataset = CustomVideoClsDatasetNumeric(
-            anno_path=anno_path,
-            prefix=args.prefix,
-            split=args.split,
-            mode=mode,
-            clip_len=args.num_frames,
-            crop_size=args.input_size,
-            short_side_size=args.short_side_size,
-            new_height=256,
-            new_width=320,
-            filename_tmpl=args.filename_tmpl,
-            args=args
-        )
-        nb_classes = args.nb_classes
+    # elif args.data_set == 'MyCustom':
+    #     # mode = 'train' if is_train else ('test' if test_mode else 'validation')
+    #     # anno_path = os.path.join(args.data_path, f"{mode}.csv")
+    #     # dataset = CustomVideoClsDatasetNumeric(
+    #     #     anno_path=anno_path,
+    #     #     prefix=args.prefix,
+    #     #     split=args.split,
+    #     #     mode=mode,
+    #     #     clip_len=args.num_frames,
+    #     #     crop_size=args.input_size,
+    #     #     short_side_size=args.short_side_size,
+    #     #     new_height=256,
+    #     #     new_width=320,
+    #     #     filename_tmpl=args.filename_tmpl,
+    #     #     args=args
+    #     # )
+    #     # # nb_classes = len(set(dataset.label_array))
+    #     # nb_classes = 6
+    #     if is_train:
+    #         mode = 'train'
+    #     else:
+    #         mode = 'test'
+    #     if args.internal_test and test_mode:
+    #         path_prefix = "internal_"
+    #     else:
+    #         path_prefix = ""
+    #     if args.multilabel:
+    #         anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_multilabel_cleaned.csv")
+    #     else:
+    #         anno_path = os.path.join(args.data_path, f"{path_prefix}{mode}_bhavna_singlelabel_cleaned.csv")
+    #     dataset = CustomVideoClsDatasetNumeric(
+    #         anno_path=anno_path,
+    #         prefix=args.prefix,
+    #         split=args.split,
+    #         mode=mode,
+    #         clip_len=args.num_frames,
+    #         crop_size=args.input_size,
+    #         short_side_size=args.short_side_size,
+    #         new_height=256,
+    #         new_width=320,
+    #         filename_tmpl=args.filename_tmpl,
+    #         args=args
+    #     )
+    #     nb_classes = args.nb_classes
     else:
         print(f'Unsupported dataset: {args.data_set}')
         raise NotImplementedError()

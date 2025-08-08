@@ -372,6 +372,12 @@ def init_distributed_mode(args):
     # assert torch.distributed.is_initialized()
     setup_for_distributed(args.rank == 0)
 
+def print_all_subkeys(d, parent_key=''):
+    for k, v in d.items():
+        current_key = f"{parent_key}.{k}" if parent_key else k
+        print(current_key)
+        if isinstance(v, dict):
+            print_all_subkeys(v, current_key)
 
 def load_state_dict(model, state_dict, prefix='', ignore_missing="relative_position_index"):
     missing_keys = []
@@ -381,7 +387,8 @@ def load_state_dict(model, state_dict, prefix='', ignore_missing="relative_posit
     state_dict = state_dict.copy()
     if metadata is not None:
         state_dict._metadata = metadata
-
+    state_dict = {k.replace("vision_encoder.", ""): v for (k,v) in state_dict.items()}
+    print_all_subkeys(state_dict)
     def load(module, prefix=''):
         local_metadata = {} if metadata is None else metadata.get(
             prefix[:-1], {})
