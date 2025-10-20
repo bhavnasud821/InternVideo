@@ -6,14 +6,12 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='linear_probing_1B_model_18'
+JOB_NAME='linear_probing_1B_model_18_yolo_crops'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
 DATA_PATH='/home/saumya/internal_vids'   # Directory containing CSV annotation files and videos
 # MODEL_PATH='/home/saumya/pytorch_model_distilled_B14_ft_k710_f8.bin'    # Path to pretrained checkpoint
-# MODEL_PATH='/home/bhavna/mp_rank_00_model_states_finetuned_stage2_video_encoder.pt'
-# MODEL_PATH='/home/saumya/internvideo2_B_vision_model_stage_2.bin'
 MODEL_PATH='/home/saumya/1B_ft_k710_f8.pth'
 
 # GPU and CPU configurations
@@ -67,7 +65,11 @@ python run_linear_probing.py \
     --test_anno_path /home/saumya/internal_vids/internal_test_bhavna_singlelabel_with_negative_18.csv \
     --test_best \
     --enable_class_weights \
-    --min_padding_ratio 0.2 \
-    --max_padding_ratio 1.0 \
+    --eval_yolo_crops \
+    --train_yolo_crops \
+    --min_padding_ratio_positive 0.0 \
+    --max_padding_ratio_positive 1.0 \
+    --min_padding_ratio_negative 0.0 \
+    --max_padding_ratio_negative 1.0 \
     --test_padding_ratio 0.1
 

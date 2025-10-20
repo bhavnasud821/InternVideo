@@ -28,10 +28,7 @@ class CustomVideoClsDatasetNumeric:
 
         cleaned = pd.read_csv(self.anno_path, header=None, delimiter=",")
         self.dataset_samples = list(cleaned.values[:, 0])
-        if args.multilabel:
-            self.label_array = cleaned.iloc[:, 1:].to_numpy().astype(np.float32)
-        else:
-            self.label_array = list(cleaned.values[:, 1])
+        self.label_array = list(cleaned.values[:, 1])
         self.num_classes = self.label_array.shape[1] if args.multilabel else len(set(self.label_array))
         print(f"Initialized dataset with {len(self.dataset_samples)} samples and {self.num_classes} classes.")
 

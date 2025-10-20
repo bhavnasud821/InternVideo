@@ -64,6 +64,7 @@ class HMDBVideoClsDataset(Dataset):
         self.num_crop = num_crop
         self.test_num_crop = test_num_crop
         self.args = args
+        self.multilabel = args.train_multilabel if self.mode == 'train' else args.eval_multilabel
         self.aug = False
         self.rand_erase = False
         
@@ -71,7 +72,7 @@ class HMDBVideoClsDataset(Dataset):
         if has_client:
             self.client = Client('~/petreloss.conf')
 
-        if self.mode in ['train']:
+        if self.mode == 'train':
             self.aug = True
             if self.args.reprob > 0:
                 self.rand_erase = True
@@ -81,14 +82,16 @@ class HMDBVideoClsDataset(Dataset):
         import pandas as pd
         cleaned = pd.read_csv(self.anno_path, header=None, delimiter=",")
         self.dataset_samples = list(cleaned.values[:, 0])
-        if args.multilabel:
-            self.label_array = cleaned.iloc[:, 1:].to_numpy()
+        if self.multilabel:
+            labels = [np.fromstring(item.strip('[]'), dtype=int, sep=' ') for item in cleaned.iloc[:, 1].to_list()]
+            self.label_array = np.array(labels)
         else:
             self.label_array = list(cleaned.values[:, 1])
         self.class_counts = None
-        if not args.multilabel:
+        if self.multilabel:
+            self.class_counts = torch.tensor(self.label_array, dtype=torch.float).sum(dim=0)
+        else:
             self.class_counts = torch.bincount(torch.tensor(self.label_array, dtype=torch.long), minlength=args.nb_classes).float()
-
 
         if (mode == 'train'):
             self.data_resize = Compose([
@@ -121,23 +124,6 @@ class HMDBVideoClsDataset(Dataset):
             self.test_seg = []
             self.test_dataset = []
             self.test_label_array = []
-            # for idx in range(len(self.label_array)):
-            #     sample_label = self.label_array[idx]
-            #     sample = self.dataset_samples[idx]
-            #     fname = os.path.join(self.prefix, sample)
-            #     try:
-            #         fps, frame_count = get_video_info(fname)
-            #         if frame_count < 100:
-            #             num_segments = 1
-            #         else:
-            #             num_frames_3_point_2_seconds = int(fps * 3.2)
-            #             num_segments = int(frame_count / num_frames_3_point_2_seconds)
-            #         for s in range(num_segments):
-            #             self.test_label_array.append(sample_label)
-            #             self.test_dataset.append(sample)
-            #             self.test_seg.append(s)
-            #     except IOError as e:
-            #         print("Skipping video ", sample)
 
             for ck in range(self.test_num_segment):
                 for idx in range(len(self.label_array)):
@@ -151,19 +137,22 @@ class HMDBVideoClsDataset(Dataset):
             args = self.args 
             label = self.label_array[index]
             sample = self.dataset_samples[index]
-            use_second_half = (label == 2 and self.args.second_half_falling)
-            buffer = self.loadvideo_decord(sample, second_half=use_second_half) # T H W C
+            buffer = self.loadvideo_decord(sample) # T H W C
             if len(buffer) == 0:
                 while len(buffer) == 0:
                     print("video {} not correctly loaded during training".format(sample))
                     index = np.random.randint(self.__len__())
                     sample = self.dataset_samples[index]
                     label = self.label_array[index]
-                    use_second_half = (label == 2 and self.args.second_half_falling)
-                    buffer = self.loadvideo_decord(sample, second_half=use_second_half)
-            max_padding_ratio = args.max_padding_ratio_negative if self.label_array[index] == args.nb_classes - 1 else args.max_padding_ratio_positive
-            min_padding_ratio = args.min_padding_ratio_negative if self.label_array[index] == args.nb_classes - 1 else args.min_padding_ratio_positive
-            buffer = self.random_square_crop_around_people(buffer, sample, min_padding_ratio, max_padding_ratio, use_yolo_crop=args.train_yolo_crops, use_random_yolo_crop=args.use_random_yolo_crop,
+                    buffer = self.loadvideo_decord(sample)
+            negative_video = False
+            if self.multilabel and (self.label_array[index].sum() == 0):
+                negative_video = True
+            elif (not self.multilabel) and (self.label_array[index] == args.nb_classes - 1):
+                negative_video = True
+            max_padding_ratio = args.max_padding_ratio_negative if negative_video else args.max_padding_ratio_positive
+            min_padding_ratio = args.min_padding_ratio_negative if negative_video else args.min_padding_ratio_positive
+            buffer = self.random_square_crop_around_people(buffer, sample, min_padding_ratio, max_padding_ratio, use_yolo_crop=args.train_yolo_crops,
                                                            centered=not args.new_spatial_augmentation)
             if args.save_training_images:
                 resized_buffer = self.data_resize(buffer)
@@ -182,7 +171,7 @@ class HMDBVideoClsDataset(Dataset):
                 os.makedirs(parent_dir, exist_ok=True)
                 grid.save(save_path)
             buffer = self._aug_frame(buffer, args)
-            if args.multilabel:
+            if self.multilabel:
                 return buffer, torch.tensor(self.label_array[index], dtype=torch.float32), index, {"path": sample}
             else:
                 return buffer, torch.tensor(self.label_array[index], dtype=torch.long), index, {"path": sample}
@@ -466,14 +455,9 @@ class HMDBVideoClsDataset(Dataset):
         else:
             return int(temp_x1), int(temp_y1), int(temp_x2), int(temp_y2)
 
-    def random_square_crop_around_people(self, buffer, sample, min_padding_ratio, max_padding_ratio, use_yolo_crop=False, use_random_yolo_crop=False, centered=True):
+    def random_square_crop_around_people(self, buffer, sample, min_padding_ratio, max_padding_ratio, use_yolo_crop=False, centered=True):
         # print("centered is ", centered)
         video_fname = os.path.join(self.prefix, sample)
-        if use_random_yolo_crop:
-            if random.random() < 0.5:
-                use_yolo_crop = True
-            else:
-                use_yolo_crop = False
         if use_yolo_crop:
             if os.path.exists(video_fname.replace(".mp4", "_yolo_crop_info.txt")):
                 crop_info_fname = video_fname.replace(".mp4", "_yolo_crop_info.txt")
@@ -494,15 +478,13 @@ class HMDBVideoClsDataset(Dataset):
                 x1, y1, x2, y2 = self.expand_to_square(crop_x1, crop_y1, crop_x2, crop_y2, video_w, video_h, padding_ratio=random_padding_ratio)
             else:
                 # first make the bbox square without expanding
-                # print("coords before expand to square ", crop_x1, " ", crop_y1, " ", crop_x2, " ", crop_y2, " frame width ", video_w, " frame height ", video_h)
                 x1, y1, x2, y2 = self.expand_to_square(crop_x1, crop_y1, crop_x2, crop_y2, video_w, video_h, padding_ratio=0)
-                # print("coords after expand to square ", x1, " ", y1, " ", x2, " ", y2, " frame width ", video_w, " frame height ", video_h)
                 # then expand randomly in the left, right, top, and bottom directions
                 x1, y1, x2, y2 = self.expand_bbox_non_centered(x1, y1, x2, y2, video_w, video_h, min_padding_ratio, max_padding_ratio)
             buffer = buffer[:, y1:y2, x1:x2, :]
         return buffer
 
-    def loadvideo_decord(self, sample, second_half=False):
+    def loadvideo_decord(self, sample):
         """Load video content using Decord"""
         fname = os.path.join(self.prefix, sample)
 
@@ -528,31 +510,10 @@ class HMDBVideoClsDataset(Dataset):
                                     num_threads=1, ctx=cpu(0))
 
             if self.mode == 'test':
-                # tick = len(vr) / float(self.num_segment)
-                # all_index = list(np.array([int(tick / 2.0 + tick * x) for x in range(self.num_segment)] +
-                #                    [int(tick * x) for x in range(self.num_segment)]))
-                # while len(all_index) < (self.num_segment * self.test_num_segment):
-                #     all_index.append(all_index[-1])
-                # all_index = np.sort(np.array(all_index))
-                # vr.seek(0)
                 total_frames = len(vr)
-                # if total_frames < 100:
                 all_index = np.linspace(0, total_frames - 1, self.num_segment, dtype=int).tolist()
                 buffer = vr.get_batch(all_index).asnumpy()
                 return buffer
-                # else:
-                #     # get the correct 3.2 second chunk
-                #     try:
-                #         num_frames_3_point_2_seconds = int(vr.get_avg_fps() * 3.2)
-                #         start_frame = segment_idx * num_frames_3_point_2_seconds
-                #         all_index = np.linspace(start_frame, min(start_frame + num_frames_3_point_2_seconds, total_frames - 1), self.num_segment, dtype=int).tolist()
-                #         buffer = vr.get_batch(all_index).asnumpy()
-                #         return buffer
-                #     except Exception as e:
-                #         print("segment idx is ", segment_idx, "num frames 3.2 is ", num_frames_3_point_2_seconds, " frame rate is ", vr.get_avg_fps(), " and total frames is ", total_frames)
-                #         raise e
-
-
             elif self.mode == 'validation':
                 tick = len(vr) / float(self.num_segment)
                 all_index = np.array([int(tick / 2.0 + tick * x) for x in range(self.num_segment)])
@@ -561,10 +522,7 @@ class HMDBVideoClsDataset(Dataset):
                 return buffer
 
             # handle temporal segments
-            if second_half:
-                start_idx = len(vr) // 2
-            else:
-                start_idx = 0
+            start_idx = 0
             sampling_range = len(vr) - start_idx
             average_duration = sampling_range // self.num_segment
             if average_duration > 0:
@@ -575,7 +533,6 @@ class HMDBVideoClsDataset(Dataset):
                                                                                                             # size=self.num_segment))
             elif len(vr) > self.num_segment:
                 all_index = list(np.sort(np.random.randint(start_idx, len(vr), size=self.num_segment)))
-                # all_index = list(np.sort(np.random.randint(len(vr), size=self.num_segment)))
             else:
                 all_index = list(np.zeros((self.num_segment,)))
             vr.seek(0)

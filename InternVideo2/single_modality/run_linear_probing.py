@@ -22,7 +22,7 @@ from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValu
 from datasets import build_dataset
 from engines.engine_for_finetuning import train_one_epoch, validation_one_epoch, final_test, merge
 # from engines.engine_for_finetuning import train_one_epoch, validation_one_epoch, final_test, merge
-from utils import NativeScalerWithGradNormCount as NativeScaler
+from utils import FocalLoss, NativeScalerWithGradNormCount as NativeScaler
 from utils import multiple_samples_collate
 import utils
 from models import *
@@ -43,7 +43,8 @@ def get_args():
     parser.set_defaults(use_ceph_checkpoint=False)
     parser.add_argument('--ceph_checkpoint_prefix', default='', type=str, help='prefix for checkpoint in ceph')
     parser.add_argument('--ckpt_path_split', default='/exp/', type=str, help='string for splitting the ckpt_path')
-    parser.add_argument('--multilabel', action='store_true', help="whether to use multilabel sigmoid loss training")
+    parser.add_argument('--train_multilabel', action='store_true', help="whether to use multilabel sigmoid loss training")
+    parser.add_argument('--eval_multilabel', action='store_true', help="whether to use multilabel during evaluation")
     parser.add_argument('--grayscale', action='store_true', help='whether to train with grayscale videos')
     parser.add_argument('--include_negative_category', action='store_true', help='whether to include a negative category for single label model training')
     parser.add_argument('--internal_loss_scale', type=float, default=1.0, help='How much to scale internal data during training')
@@ -60,9 +61,9 @@ def get_args():
     parser.add_argument('--test_padding_ratio', type=float, default=0.1, help='amount to expand bbox around people during testing')
     parser.add_argument('--eval_yolo_crops', action='store_true', help='Whether to use yolo crops for evaluation, otherwise use the crops from labeled activity')
     parser.add_argument('--train_yolo_crops', action='store_true', help='Whether to use yolo crops for training, otherwise use the crops from labeled activity')
-    parser.add_argument('--use_random_yolo_crop', action='store_true', help='Whether to randomly switch between yolo crops and labeled activity crops during training')
     parser.add_argument('--spatial_augmentation_min_scale', type=float, default=0.08, help='Minimum scale for spatial augmentation')
     parser.add_argument('--new_spatial_augmentation', action='store_true', help='Whether to apply new spatial augmentation to create random bbox that must included activity/people')
+    parser.add_argument('--use_focal_loss', action='store_true', help='Whether to use focal loss')
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
@@ -591,12 +592,29 @@ def main(args, ds_init):
     )
     print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
-    if args.multilabel:
-        criterion = BCEWithLogitsLoss(reduction='none')
+    if args.train_multilabel:
+        class_counts = dataset_train.class_counts
+        print("class counts ", class_counts)
+        # Compute weights: inverse of frequency (add epsilon to avoid div by 0)
+        epsilon = 1e-6
+        class_weights = 1.0 / (class_counts + epsilon)
+        class_weights = class_weights / class_weights.sum()
+        class_weights = class_weights.to(device)
+        print("class weights ", class_weights)
+        if args.enable_class_weights:
+            criterion = BCEWithLogitsLoss(reduction='none', pos_weight=class_weights)
+        else:
+            criterion = BCEWithLogitsLoss(reduction='none')
     elif mixup_fn is not None:
         criterion = SoftTargetCrossEntropy()
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    elif args.use_focal_loss:
+        class_counts = dataset_train.class_counts
+        class_weights = 1.0 / (class_counts + 1e-6)
+        alpha = class_weights / class_weights.sum()
+        alpha = alpha.to(device)
+        criterion = FocalLoss(alpha=alpha, reduction='none')
     else:
         class_counts = dataset_train.class_counts
         print("class counts ", class_counts)
@@ -636,9 +654,13 @@ def main(args, ds_init):
     print(f"Use bf16 {args.bf16}")
 
     if args.eval:
-        preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
         internal = "internal_test" in args.test_anno_path
-        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=args.enable_deepspeed, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
+        if internal:
+            preds_file = os.path.join(args.output_dir, "internal_" + str(global_rank) + '_preds.txt')
+        else:
+            preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
+        average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=args.enable_deepspeed, bf16=args.bf16,
+                                           train_multilabel=args.train_multilabel, eval_multilabel=args.eval_multilabel, output_dir=args.output_dir, internal=internal)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
         # if global_rank == 0:
@@ -666,7 +688,7 @@ def main(args, ds_init):
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale, multilabel=args.multilabel
+            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale, multilabel=args.eval_multilabel
         )
         if args.output_dir and args.save_ckpt:
             utils.save_model(
@@ -675,9 +697,13 @@ def main(args, ds_init):
                 ceph_args=ceph_args,
             )
         if data_loader_test is not None:
-            preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
             internal = "internal_test" in args.test_anno_path
-            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
+            if internal:
+                preds_file = os.path.join(args.output_dir, "internal_" + str(global_rank) + '_preds.txt')
+            else:
+                preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
+            average_ap, class_aps = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16,
+                                               train_multilabel=args.train_multilabel, eval_multilabel=args.eval_multilabel, output_dir=args.output_dir, internal=internal)
             print("Got average AP ", average_ap)
             # test_stats = validation_one_epoch(data_loader_test, model, device, ds=False, bf16=False)
             # print(f"test_stats: {test_stats}")
@@ -715,7 +741,11 @@ def main(args, ds_init):
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
+    internal = "internal_test" in args.test_anno_path
+    if internal:
+        preds_file = os.path.join(args.output_dir, "internal_" + str(global_rank) + '_preds.txt')
+    else:
+        preds_file = os.path.join(args.output_dir, str(global_rank) + '_preds.txt')
     if args.test_best:
         print("Auto testing the best model")
         args.eval = True
@@ -724,8 +754,8 @@ def main(args, ds_init):
             optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema,
             ceph_args=ceph_args,
         )
-    internal = "internal_test" in args.test_anno_path
-    average_ap = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16, multilabel=args.multilabel, output_dir=args.output_dir, internal=internal)
+    average_ap = final_test(data_loader_test, model, device, preds_file, args.nb_classes, ds=False, bf16=args.bf16,
+                            train_multilabel=args.train_multilabel, eval_multilabel=args.eval_multilabel, output_dir=args.output_dir, internal=internal)
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
     # if global_rank == 0:

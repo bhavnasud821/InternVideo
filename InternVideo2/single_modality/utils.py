@@ -13,6 +13,7 @@ import subprocess
 import torch
 import torch.distributed as dist
 from torch import inf
+import torch.nn.functional as F
 import random
 
 from tensorboardX import SummaryWriter
@@ -26,6 +27,51 @@ except ImportError:
     has_client = False
     client = None
 
+class FocalLoss(torch.nn.Module):
+    def __init__(self, alpha=None, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        # alpha can be a single float or a tensor of class weights
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs are the raw logits (unnormalized scores)
+        # targets are the class indices (e.g., 0, 1, 2, ...)
+
+        # Step 1: Compute the standard Cross-Entropy Loss for each example
+        # The 'reduction' must be 'none' to get the loss per example
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+
+        # Step 2: Compute pt, the probability of the true class
+        # This is a key step.
+        # F.cross_entropy computes log(pt), so pt = exp(-ce_loss)
+        pt = torch.exp(-ce_loss)
+
+        # Step 3: Apply the focal loss modulating factor
+        focal_loss = (1 - pt)**self.gamma * ce_loss
+
+        # Step 4: Apply the class-balancing factor (alpha) if provided
+        if self.alpha is not None:
+            # You can pass class weights as a tensor for alpha
+            # The weights are indexed by the target class
+            if isinstance(self.alpha, (float, int)):
+                # If alpha is a single float, apply it to all samples
+                alpha_factor = self.alpha
+            else:
+                # If alpha is a tensor of class weights, select the weight for each sample
+                # using the target indices
+                alpha_factor = self.alpha[targets]
+            
+            focal_loss = alpha_factor * focal_loss
+
+        # Step 5: Apply the final reduction
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
