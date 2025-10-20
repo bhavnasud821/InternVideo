@@ -205,11 +205,8 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
     header = "Test:"
     model.eval()
 
-    # all_top1 = []
     all_targets = []
     all_video_ids = []
-    # all_top5 = []
-    # all_top5_scores = []
     all_probs = []
 
     # Category mapping 
@@ -236,14 +233,9 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
             probs = torch.sigmoid(output)
         else:
             probs = torch.softmax(output, dim=-1)
-        # top1_preds = output.argmax(dim=-1)
-        # top5_scores, top5_preds = torch.topk(probs, 5, dim=-1)
 
-        # all_top1.extend(top1_preds.cpu().tolist())
         all_targets.extend(target.cpu().tolist())
         all_video_ids.extend(video_ids)
-        # all_top5_scores.extend(top5_scores.cpu().tolist())
-        # all_top5.extend(top5_preds.cpu().tolist())
         all_probs.append(probs.cpu())
 
         # Save per-sample predictions (JSON-serialized)
@@ -263,7 +255,6 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
 
     # Combine probabilities from all batches
     all_probs = torch.cat(all_probs, dim=0)  # shape [N, C]
-
 
     # Average results by segment_idx that correspond to same video
     # Dictionary to store sums of probabilities and counts for averaging
@@ -365,9 +356,6 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
     else:
         print("No data to generate the Concurrent Label Confusion Heatmap.")
 
-    # Optional: Display the plot if running in an interactive environment
-    # plt.show()
-
     # --- Plotting Precision-Recall Curves ---
     all_probs_np = probs
     all_targets_np = np.array(new_all_targets)
@@ -398,21 +386,11 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
 
      # --- Calculate and Print Precision and Recall for a Specific Threshold ---
     print("\n--- Precision and Recall at a Specific Threshold ---")
-    if num_classes == 7:
-        ACTIVITY_THRESHOLDS = {
-            0: 0.5,
-            1: 0.5,
-            2: 0.3,
-            3: 0.5,
-            4: 1.0,
-            5: 0.5
-        }
-    else:
-        ACTIVITY_THRESHOLDS = {
-            0: 0.7,
-            1: 0.7,
-            2: 0.7
-        }
+    ACTIVITY_THRESHOLDS = {
+        0: 0.7,
+        1: 0.7,
+        2: 0.7
+    }
 
     for i in range(C - 1):
         # Convert probabilities to binary predictions based on the threshold
@@ -430,7 +408,7 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         except ValueError:
             class_recall = 0.0
 
-        print(f"Class '{category_names[i]}': Precision = {class_precision:.4f}, Recall = {class_recall:.4f}")
+        print(f"Class '{category_names[i]}': Precision = {class_precision:.4f}, Recall = {class_recall:.4f}, Threshold = {ACTIVITY_THRESHOLDS[i]}")
 
     safe_barrier()
     # return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
@@ -440,78 +418,8 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
 # MERGE FUNCTION
 ############################################################################
 def merge(eval_path, num_tasks):
-    """
-    Reads prediction files (named "0.txt", "1.txt", …) from eval_path and computes:
-      - Overall top-1 and top-5 accuracy.
-      - Per-category top-1 and top-5 accuracy.
-    Debug statements are included.
-    """
-    overall_correct_top1 = 0
-    overall_correct_top5 = 0
-    overall_count = 0
-    per_cat_stats = defaultdict(lambda: {"correct_top1": 0, "correct_top5": 0, "count": 0})
-    
-    print("[DEBUG] Reading individual output files for merging...")
-    for i in range(num_tasks):
-        pred_file = os.path.join(eval_path, f"{i}.txt")
-        if not os.path.exists(pred_file):
-            print(f"[DEBUG] File {pred_file} not found, skipping.")
-            continue
-        with open(pred_file, "r") as f:
-            lines = f.readlines()
-        if len(lines) == 0:
-            continue
-        # Skip header line
-        for line in lines[1:]:
-            parts = json.loads(line)
-            print("parts ", parts)
-            if len(parts) < 3:
-                print(f"[DEBUG] Line skipped due to insufficient parts: {line}")
-                continue
-            try:
-                probs = parts[1]
-                # probs = json.loads(parts[1])
-            except Exception as e:
-                print(f"[DEBUG] JSON parse failed for line: {line} with error: {e}")
-                continue
-            try:
-                true_label = int(parts[2])
-            except Exception as e:
-                print(f"[DEBUG] True label parse failed for line: {line} with error: {e}")
-                continue
-            sorted_idx = sorted(range(len(probs)), key=lambda j: probs[j], reverse=True)
-            top1 = sorted_idx[0]
-            top5 = sorted_idx[:5]
-            overall_count += 1
-            if top1 == true_label:
-                overall_correct_top1 += 1
-            if true_label in top5:
-                overall_correct_top5 += 1
-            per_cat_stats[true_label]["count"] += 1
-            if top1 == true_label:
-                per_cat_stats[true_label]["correct_top1"] += 1
-            if true_label in top5:
-                per_cat_stats[true_label]["correct_top5"] += 1
-    
-    overall_top1 = overall_correct_top1 / overall_count if overall_count > 0 else 0
-    overall_top5 = overall_correct_top5 / overall_count if overall_count > 0 else 0
-
-    # print(f"[DEBUG] Overall Merged Accuracy: Top-1: {overall_top1*100:.2f}%, Top-5: {overall_top5*100:.2f}%")
-    # print("Per-category accuracies (merged):")
-    for cat in sorted(per_cat_stats.keys()):
-        stats = per_cat_stats[cat]
-        cat_acc1 = stats["correct_top1"] / stats["count"] if stats["count"] > 0 else 0
-        cat_acc5 = stats["correct_top5"] / stats["count"] if stats["count"] > 0 else 0
-        # print(f"  Category {cat}: Top-1: {cat_acc1*100:.2f}%, Top-5: {cat_acc5*100:.2f}%")
-    return overall_top1, overall_top5
-
-def compute_video(lst):
-    i, video_id, data, label = lst
-    feat = np.mean(data, axis=0)
-    pred = np.argmax(feat)
-    top1 = 1.0 if int(pred) == int(label) else 0.0
-    top5 = 1.0 if int(label) in np.argsort(-feat)[:5] else 0.0
-    return [pred, top1, top5, int(label)]
+    # not used
+    return None, None
 
 ############################################################################
 # End of file
