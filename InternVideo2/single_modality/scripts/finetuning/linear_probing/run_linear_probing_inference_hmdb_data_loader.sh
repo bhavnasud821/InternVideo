@@ -5,27 +5,6 @@ export MASTER_PORT=$((12000 + $RANDOM % 20000))
 export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Job parameters
-# JOB_NAME='linear_probing_B_model_hmdb_data_loader_no_mixup_no_smoothing_bhavna_datasets'
-# JOB_NAME='full_tuning_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_4_filtered'
-# JOB_NAME='full_tuning_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_4_filtered_more_climbing_vids'
-# JOB_NAME='attentive_probing_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_larger_including_negative_category_higher_internal_weight'
-# JOB_NAME='full_tuning_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_5_combined_cropped'
-# JOB_NAME='full_tuning_B_model_hmdb_data_loader_bhavna_datasets_singlelabel_cleaned_5'
-# JOB_NAME='full_tuning_B_model_new_internal_vids_and_hmdb_falling_label_fixed'
-# JOB_NAME='full_tuning_B_model_new_internal_vids_and_hmdb_equal_class_weights'
-# JOB_NAME='full_tuning_B_model_all_relabeled_data_random_cropping_equal_class_weights_less_epochs'
-# JOB_NAME='full_tuning_B_model_all_relabeled_data_larger_random_cropping_equal_class_weights_less_epochs'
-# JOB_NAME='full_tuning_B_model_all_relabeled_data_vlm_filtered_larger_random_cropping_equal_class_weights_less_epochs'
-# JOB_NAME='attentive_probing_B_model_all_relabeled_data_random_cropping_equal_class_weights_less_epochs'
-# JOB_NAME='linear_probing_B_model_all_relabeled_data_random_cropping_equal_class_weights_finetuned_stage2_encoder'
-# JOB_NAME='full_tuning_S_model_all_relabeled_data_including_youtube_no_motorcycles_cleaned_internal_vids_larger_random_cropping_equal_class_weights'
-# JOB_NAME='full_tuning_S_model_all_relabeled_data_including_youtube_larger_random_cropping_6_sec_vids'
-# JOB_NAME='full_tuning_B_model_22_yolo_crops'
-# JOB_NAME='full_tuning_S_model_4_frames_18_yolo_crops_only_translation'
-# JOB_NAME='attentive_probing_1B_model_8_frames_22_yolo_crops'
-# JOB_NAME='attentive_probing_1B_model_8_frames_18_yolo_crops'
-# JOB_NAME="full_tuning_S_model_4_frames_18_yolo_crops_only_translation"
 
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
@@ -40,7 +19,8 @@ GPUS=8
 GPUS_PER_NODE=8
 CPUS_PER_TASK=16 
 
-JOB_NAMES=("full_tuning_B_model_31_yolo_crops")
+JOB_NAMES=("full_tuning_S_model_3_frames_37_yolo_crops_multilabel")
+# JOB_NAMES=("full_tuning_B_model_37_yolo_crops_singlelabel")
 
 for JOB_NAME in "${JOB_NAMES[@]}"; do
     OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
@@ -68,7 +48,7 @@ for JOB_NAME in "${JOB_NAMES[@]}"; do
         --data_path ${DATA_PATH} \
         --prefix ${PREFIX} \
         --data_set 'HMDB51' \
-        --nb_classes 4 \
+        --nb_classes 3 \
         --finetune ${MODEL_PATH} \
         --log_dir ${OUTPUT_DIR} \
         --output_dir ${OUTPUT_DIR} \
@@ -106,14 +86,15 @@ for JOB_NAME in "${JOB_NAMES[@]}"; do
         --eval \
         --test_best \
         --save_preds \
-        --sample_path /home/saumya/internal_vids/test_fighting_videos_combined_cropped_longer_v4_8_frames
+        --sample_path /home/saumya/internal_vids/test_fighting_videos_combined_cropped_longer_v4_8_frames \
+        --eval_multilabel
+        # --sample_path /home/saumya/internal_vids/test_camera_vids_8_frames/falling \
+        # --sample_path /home/saumya/internal_vids/test_fighting_videos_combined_cropped_longer_v4_8_frames
         # --sample_path /home/saumya/internal_vids/atlantis_test_vids_combined_cropped_longer_v4_8_frames
-        # --sample_path /home/saumya/internal_vids/test_falls_august_combined_cropped_longer_v4_16_frames
         # --sample_path /home/saumya/internal_vids/demo_vids_combined_cropped_longer_v4_16_frames/2024-08-26_21-10-58_utc_838154f6-0930-4d33-903f-13d2eb66ea71_segment_9.mp4
         # --sample_path /home/saumya/internal_vids/gemini_generated_vids_negative_combined_cropped_longer_v4_16_frames
         # --sample_path /home/saumya/internal_vids/gemini_generated_hard_negatives_combined_cropped_longer_v4_16_frames
         # --sample_path /home/saumya/internal_vids/gemini_generated_hard_negatives \
-        # --sample_path /home/saumya/internal_vids/test_camera_vids_8_frames/falling \
         # --sample_path /home/saumya/internal_vids/test_camera_vids_8_frames/negative
         # --sample_path /home/saumya/internal_vids/darden_test_vids_combined_cropped_longer_v4/negative
         # --sample_path /home/saumya/internal_vids/darden_test_vids_combined_cropped_longer_v4_16_frames
