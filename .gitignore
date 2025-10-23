@@ -15,7 +15,8 @@ debug*
 
 # custom
 .vscode
-
+InternVideo2/single_modality/scripts/finetuning/linear_probing/*/
+InternVideo2/single_modality/*.png
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

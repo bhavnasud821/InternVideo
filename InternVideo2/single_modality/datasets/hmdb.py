@@ -153,7 +153,7 @@ class HMDBVideoClsDataset(Dataset):
             max_padding_ratio = args.max_padding_ratio_negative if negative_video else args.max_padding_ratio_positive
             min_padding_ratio = args.min_padding_ratio_negative if negative_video else args.min_padding_ratio_positive
             buffer = self.random_square_crop_around_people(buffer, sample, min_padding_ratio, max_padding_ratio, use_yolo_crop=args.train_yolo_crops,
-                                                           centered=not args.new_spatial_augmentation)
+                                                           filter_edge_people=False)
             if args.save_training_images:
                 resized_buffer = self.data_resize(buffer)
                 # save input image
@@ -190,7 +190,8 @@ class HMDBVideoClsDataset(Dataset):
                     sample = self.test_dataset[index]
                     # segment_idx = 0
                     buffer = self.loadvideo_decord(sample)
-            buffer = self.random_square_crop_around_people(buffer, sample, args.test_padding_ratio, args.test_padding_ratio, use_yolo_crop=args.eval_yolo_crops)
+            buffer = self.random_square_crop_around_people(buffer, sample, args.test_padding_ratio, args.test_padding_ratio,
+                                                           use_yolo_crop=args.eval_yolo_crops, filter_edge_people=args.eval_filter_edge_people)
             buffer = self.data_resize(buffer)
             if args.save_training_images:
                 # save input image
@@ -358,108 +359,12 @@ class HMDBVideoClsDataset(Dataset):
 
         return final_x1, final_y1, final_x2, final_y2
 
-    def expand_bbox_non_centered(self, x1, y1, x2, y2, frame_width, frame_height, min_padding_ratio, max_padding_ratio):
-        """
-        Expands a bounding box by a random amount on each side, clamping to frame boundaries. The original bounding box will always be contained.
-
-        Args:
-            x1, y1, x2, y2 (int): Coordinates of the original bounding box (inclusive, pixel values).
-            frame_width (int): Width of the video frame.
-            frame_height (int): Height of the video frame.
-            min_padding_ratio (float): Minimum ratio by which individual padding amounts can exceed
-                                       the original bbox dimension (e.g., 0.1 means up to 10% of bbox_w/h).
-            max_padding_ratio (float): Maximum ratio by which individual padding amounts can exceed
-                                       the original bbox dimension (e.g., 0.1 means up to 10% of bbox_w/h).
-
-        Returns:
-            tuple: (x1_crop, y1_crop, x2_crop, y2_crop) - the coordinates of the new crop.
-                   Returns full frame (0,0,frame_width,frame_height) on failure.
-        """
-        bbox_w = x2 - x1
-        bbox_h = y2 - y1
-
-        # Handle invalid or empty bounding box by returning the full frame
-        if bbox_w <= 0 or bbox_h <= 0:
-            print("Warning: random_padded_square_crop received an invalid bounding box. Returning full frame.")
-            return 0, 0, frame_width, frame_height
-
-        # 1. Generate random padding for each side
-        bias_horizontal = random.choice([True, False])
-
-        if bias_horizontal:
-            # Bias padding horizontally
-            if random.choice([True, False]): # Bias to the left
-                pad_left = random.uniform(min_padding_ratio * bbox_w, max_padding_ratio * bbox_w) # More padding
-                pad_right = random.uniform(min_padding_ratio * bbox_w, max_padding_ratio * bbox_w / 2) # Less padding
-            else: # Bias to the right
-                pad_left = random.uniform(min_padding_ratio * bbox_w, max_padding_ratio * bbox_w / 2) # Less padding
-                pad_right = random.uniform(min_padding_ratio * bbox_w, max_padding_ratio * bbox_w) # More padding
-
-            # Vertical padding remains somewhat balanced but still random
-            pad_top = random.uniform(min_padding_ratio * bbox_h, max_padding_ratio * bbox_h)
-            pad_bottom = random.uniform(min_padding_ratio * bbox_h, max_padding_ratio * bbox_h)
-        else:
-            # Bias padding vertically
-            if random.choice([True, False]): # Bias to the top
-                pad_top = random.uniform(min_padding_ratio * bbox_h, max_padding_ratio * bbox_h) # More padding
-                pad_bottom = random.uniform(min_padding_ratio * bbox_h, max_padding_ratio * bbox_h / 2) # Less padding
-            else: # Bias to the bottom
-                pad_top = random.uniform(min_padding_ratio * bbox_h, max_padding_ratio * bbox_h / 2) # Less padding
-                pad_bottom = random.uniform(min_padding_ratio * bbox_h, max_padding_ratio * bbox_h) # More padding
-
-            # Horizontal padding remains somewhat balanced but still random
-            pad_left = random.uniform(min_padding_ratio * bbox_w, max_padding_ratio * bbox_w)
-            pad_right = random.uniform(min_padding_ratio * bbox_w, max_padding_ratio * bbox_w)
-
-        # print("chosen paddings, left ", pad_left, " right ", pad_right, " top ", pad_top, " bottom ", pad_bottom)
-
-        # 2. Apply padding and clamp to frame boundaries for initial expanded box
-        temp_x1 = max(0.0, x1 - pad_left)
-        temp_y1 = max(0.0, y1 - pad_top)
-        temp_x2 = min(float(frame_width), x2 + pad_right)
-        temp_y2 = min(float(frame_height), y2 + pad_bottom)
-
-        # Calculate current dimensions of the initially padded and clamped box
-        current_w = temp_x2 - temp_x1
-        current_h = temp_y2 - temp_y1
-
-        # Fallback if initial random padding resulted in an invalid box (e.g., due to extreme clamping)
-        if current_w <= 0 or current_h <= 0:
-            print("Warning: Initial random padding resulted in zero or negative dimensions after clamping. Returning full frame.")
-            return 0, 0, frame_width, frame_height
-
-        # print("temp_x1: ", temp_x1,", temp_y1: ", temp_y1, ", temp_x2: ", temp_x2, ", temp_y2: ", temp_y2, ", frame_width: ", frame_width, ", frame_height: ", frame_height)
-        if current_w / current_h < 0.75 or current_w / current_h > 1.33:
-            # 3. Adjust to make the box square, expanding the smaller dimension
-            # Determine the target side length (the larger of the current dimensions)
-            target_side = max(current_w, current_h)
-
-            # Calculate the center of the current padded box
-            center_x = (temp_x1 + temp_x2) / 2.0
-            center_y = (temp_y1 + temp_y2) / 2.0
-
-            # Attempt to create a square of 'target_side' length, centered on the current box
-            final_x1_cand = center_x - target_side / 2.0
-            final_y1_cand = center_y - target_side / 2.0
-            final_x2_cand = center_x + target_side / 2.0
-            final_y2_cand = center_y + target_side / 2.0
-
-            # Clamp these candidate coordinates to ensure they are within frame boundaries
-            clamped_x1 = max(0.0, final_x1_cand)
-            clamped_y1 = max(0.0, final_y1_cand)
-            clamped_x2 = min(float(frame_width), final_x2_cand)
-            clamped_y2 = min(float(frame_height), final_y2_cand)
-
-            # print("expanded because of aspect ratio, new coords x1 y1 x2 y2: ", clamped_x1, " ", clamped_y1, " ", clamped_x2, " ", clamped_y2)
-            return int(clamped_x1), int(clamped_y1), int(clamped_x2), int(clamped_y2)
-        else:
-            return int(temp_x1), int(temp_y1), int(temp_x2), int(temp_y2)
-
-    def random_square_crop_around_people(self, buffer, sample, min_padding_ratio, max_padding_ratio, use_yolo_crop=False, centered=True):
-        # print("centered is ", centered)
+    def random_square_crop_around_people(self, buffer, sample, min_padding_ratio, max_padding_ratio, use_yolo_crop=False, filter_edge_people=False):
         video_fname = os.path.join(self.prefix, sample)
         if use_yolo_crop:
-            if os.path.exists(video_fname.replace(".mp4", "_yolo_crop_info.txt")):
+            if filter_edge_people and os.path.exists(video_fname.replace(".mp4", "_no_edge_people_yolo_crop_info.txt")):
+                crop_info_fname = video_fname.replace(".mp4", "_no_edge_people_yolo_crop_info.txt")
+            elif os.path.exists(video_fname.replace(".mp4", "_yolo_crop_info.txt")):
                 crop_info_fname = video_fname.replace(".mp4", "_yolo_crop_info.txt")
             else: 
                 crop_info_fname = video_fname.replace(".mp4", "_crop_info.txt")
@@ -473,14 +378,8 @@ class HMDBVideoClsDataset(Dataset):
             crop_y2 = crop_data["crop_y2"]
             video_w = crop_data["video_w"]
             video_h = crop_data["video_h"]
-            if centered:
-                random_padding_ratio = random.uniform(min_padding_ratio, max_padding_ratio)
-                x1, y1, x2, y2 = self.expand_to_square(crop_x1, crop_y1, crop_x2, crop_y2, video_w, video_h, padding_ratio=random_padding_ratio)
-            else:
-                # first make the bbox square without expanding
-                x1, y1, x2, y2 = self.expand_to_square(crop_x1, crop_y1, crop_x2, crop_y2, video_w, video_h, padding_ratio=0)
-                # then expand randomly in the left, right, top, and bottom directions
-                x1, y1, x2, y2 = self.expand_bbox_non_centered(x1, y1, x2, y2, video_w, video_h, min_padding_ratio, max_padding_ratio)
+            random_padding_ratio = random.uniform(min_padding_ratio, max_padding_ratio)
+            x1, y1, x2, y2 = self.expand_to_square(crop_x1, crop_y1, crop_x2, crop_y2, video_w, video_h, padding_ratio=random_padding_ratio)
             buffer = buffer[:, y1:y2, x1:x2, :]
         return buffer
 

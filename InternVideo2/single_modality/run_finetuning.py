@@ -63,7 +63,7 @@ def get_args():
     parser.add_argument('--spatial_augmentation_min_scale', type=float, default=0.08, help='Minimum scale for spatial augmentation')
     parser.add_argument('--new_spatial_augmentation', action='store_true', help='Whether to apply new spatial augmentation to create random bbox that must include activity/people')
     parser.add_argument('--use_focal_loss', action='store_true', help='Whether to use focal loss')
-
+    parser.add_argument('--eval_filter_edge_people', action='store_true', help='Whether to filter out people touching edge when cropping for evaluation')
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')

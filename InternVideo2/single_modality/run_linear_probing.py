@@ -64,6 +64,7 @@ def get_args():
     parser.add_argument('--spatial_augmentation_min_scale', type=float, default=0.08, help='Minimum scale for spatial augmentation')
     parser.add_argument('--new_spatial_augmentation', action='store_true', help='Whether to apply new spatial augmentation to create random bbox that must included activity/people')
     parser.add_argument('--use_focal_loss', action='store_true', help='Whether to use focal loss')
+    parser.add_argument('--eval_filter_edge_people', action='store_true', help='Whether to filter out people touching edge when cropping for evaluation')
 
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
@@ -688,7 +689,7 @@ def main(args, ds_init):
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale, multilabel=args.eval_multilabel
+            bf16=args.bf16, internal_loss_scale=args.internal_loss_scale, multilabel=args.train_multilabel
         )
         if args.output_dir and args.save_ckpt:
             utils.save_model(

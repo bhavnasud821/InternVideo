@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='full_tuning_S_model_3_frames_37_yolo_crops_multilabel_v2'
+JOB_NAME='full_tuning_S_model_3_frames_25_yolo_crops'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
@@ -26,7 +26,7 @@ python run_finetuning.py \
     --data_path ${DATA_PATH} \
     --prefix ${PREFIX} \
     --data_set 'HMDB51' \
-    --nb_classes 3 \
+    --nb_classes 2 \
     --finetune ${MODEL_PATH} \
     --log_dir ${OUTPUT_DIR} \
     --output_dir ${OUTPUT_DIR} \
@@ -62,8 +62,8 @@ python run_finetuning.py \
     --smoothing 0 \
     --gpu 1 \
     --include_negative_category \
-    --train_anno_path /home/saumya/internal_vids/train_bhavna_multilabel_37.csv \
-    --test_anno_path /home/saumya/internal_vids/internal_test_bhavna_multilabel_37.csv \
+    --train_anno_path /home/saumya/internal_vids/train_bhavna_singlelabel_with_negative_25.csv \
+    --test_anno_path /home/saumya/internal_vids/internal_test_bhavna_singlelabel_with_negative_37_two_categories.csv \
     --eval_yolo_crops \
     --train_yolo_crops \
     --min_padding_ratio_positive 0.0 \
@@ -73,6 +73,7 @@ python run_finetuning.py \
     --test_padding_ratio 0.1 \
     --enable_class_weights \
     --test_best \
-    --train_multilabel \
+    --eval_filter_edge_people \
     --eval_multilabel \
+    # --train_multilabel \
 

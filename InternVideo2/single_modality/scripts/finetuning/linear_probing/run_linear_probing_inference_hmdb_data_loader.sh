@@ -87,7 +87,7 @@ for JOB_NAME in "${JOB_NAMES[@]}"; do
         --test_best \
         --save_preds \
         --sample_path /home/saumya/internal_vids/test_fighting_videos_combined_cropped_longer_v4_8_frames \
-        --eval_multilabel
+        --multilabel
         # --sample_path /home/saumya/internal_vids/test_camera_vids_8_frames/falling \
         # --sample_path /home/saumya/internal_vids/test_fighting_videos_combined_cropped_longer_v4_8_frames
         # --sample_path /home/saumya/internal_vids/atlantis_test_vids_combined_cropped_longer_v4_8_frames

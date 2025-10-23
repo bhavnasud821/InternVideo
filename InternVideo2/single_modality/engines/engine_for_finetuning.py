@@ -273,7 +273,7 @@ def final_test(data_loader, model, device, file, num_classes, ds=False, bf16=Fal
         else:
             if shortened_video_id not in targets_map:
                 targets_map[shortened_video_id] = np.zeros(num_classes, dtype=np.float32)
-            if target != -1:
+            if target != -1 and target < num_classes:
                 targets_map[shortened_video_id][target] = 1.0
         prob_sums[shortened_video_id] += probs
         if video_id in prob_maxes:

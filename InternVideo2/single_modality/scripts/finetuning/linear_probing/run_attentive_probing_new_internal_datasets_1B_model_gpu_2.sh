@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Job parameters
-JOB_NAME='attentive_probing_1B_model_8_frames_37_yolo_crops_singelabel_v2'
+JOB_NAME='attentive_probing_1B_model_8_frames_31_v2_yolo_crops'
 OUTPUT_DIR="$(dirname $0)/$JOB_NAME"
 LOG_DIR="./logs/${JOB_NAME}"
 PREFIX='/home/saumya/internal_vids'    # Directory containing video files
@@ -62,8 +62,8 @@ python run_linear_probing.py \
     --smoothing 0 \
     --gpu 2 \
     --include_negative_category \
-    --train_anno_path /home/saumya/internal_vids/train_bhavna_singlelabel_with_negative_37_singlelabel.csv \
-    --test_anno_path /home/saumya/internal_vids/internal_test_bhavna_singlelabel_with_negative_37_singlelabel.csv \
+    --train_anno_path /home/saumya/internal_vids/train_bhavna_singlelabel_with_negative_31_v2.csv \
+    --test_anno_path /home/saumya/internal_vids/internal_test_bhavna_multilabel_37.csv \
     --test_best \
     --enable_class_weights \
     --eval_yolo_crops \
@@ -72,5 +72,8 @@ python run_linear_probing.py \
     --max_padding_ratio_positive 1.0 \
     --min_padding_ratio_negative 0.0 \
     --max_padding_ratio_negative 1.0 \
-    --test_padding_ratio 0.1
+    --test_padding_ratio 0.1 \
+    --eval_filter_edge_people \
+    --eval_multilabel \
+    # --train_multilabel \
 

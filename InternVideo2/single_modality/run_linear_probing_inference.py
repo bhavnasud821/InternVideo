@@ -66,7 +66,7 @@ def get_args():
     parser.set_defaults(use_ceph_checkpoint=False)
     parser.add_argument('--ceph_checkpoint_prefix', default='', type=str, help='prefix for checkpoint in ceph')
     parser.add_argument('--ckpt_path_split', default='/exp/', type=str, help='string for splitting the ckpt_path')
-    parser.add_argument('--eval_multilabel', action='store_true', help="whether to use multilabel evaluation")
+    parser.add_argument('--multilabel', action='store_true', help="whether to use multilabel evaluation")
     parser.add_argument('--save_preds', action='store_true', help='Whether to save model predictions to preds_test_data.txt')
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL', help='Name of model to train')
@@ -518,7 +518,7 @@ def main(args, ds_init):
                     videos = transformed_buffer.to(device, non_blocking=True)
                 with torch.amp.autocast(device_type='cuda'):
                     output = model(videos)
-                    if args.eval_multilabel:
+                    if args.multilabel:
                         probs = torch.sigmoid(output).cpu().numpy()[0]
                     else:
                         probs = torch.softmax(output, dim=-1).cpu().numpy()[0]
